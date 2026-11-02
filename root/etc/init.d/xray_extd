@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+
+USE_PROCD=1
+
+PROG='/usr/libexec/xray_extd/xray_extd.lua'
+PATCHER='/usr/libexec/xray_extd/upstream_patches.sh'
+
+start_service()
+{
+    # The upstream package may have replaced these files during an update.
+    # Reapply only when the known upstream source layout matches exactly.
+    if [ ! -x "$PATCHER" ] || ! "$PATCHER" apply; then
+        logger -t xray_extd 'Required luci-app-xray patches are missing or could not be applied; daemon start aborted'
+        return 1
+    fi
+
+    procd_open_instance
+
+    procd_set_param command /usr/bin/lua "$PROG"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+
+    procd_close_instance
+}

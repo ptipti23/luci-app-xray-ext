@@ -1,0 +1,276 @@
+msgid "Queued…"
+msgstr ""
+
+msgid "Waiting for WAN…"
+msgstr ""
+
+msgid "Refreshing…"
+msgstr ""
+
+msgid "Refresh now"
+msgstr ""
+
+msgid "Ready to start. No update has been requested yet."
+msgstr ""
+
+msgid "Request accepted, waiting for execution…"
+msgstr ""
+
+msgid "WAN is unavailable. The request is waiting for the connection to be restored."
+msgstr ""
+
+msgid "Subscription update: processed %d of %d; successful: %d, failed: %d."
+msgstr ""
+
+msgid "Subscription update is in progress. Waiting for result data…"
+msgstr ""
+
+msgid "There are no enabled subscriptions to update."
+msgstr ""
+
+msgid "Update completed: processed %d of %d; successful: %d, failed: %d."
+msgstr ""
+
+msgid "Update completed with errors: processed %d of %d; successful: %d, failed: %d."
+msgstr ""
+
+msgid "Unknown update status."
+msgstr ""
+
+msgid "Completed: %s."
+msgstr ""
+
+msgid "The request has been sent, but status polling is temporarily unavailable. The daemon may be busy with network processing; waiting for completion and automatically retrying…"
+msgstr ""
+
+msgid "Failed to read daemon status. Retrying automatically; if the error persists, check the xray_extd.status ACL and the connection to rpcd."
+msgstr ""
+
+msgid "Sending…"
+msgstr ""
+
+msgid "Sending request to daemon…"
+msgstr ""
+
+msgid "An update is already in progress. Connecting to its current status…"
+msgstr ""
+
+msgid "The daemon did not accept the update request."
+msgstr ""
+
+msgid "Failed to send the request. Check the xray_extd.refresh ACL and the connection to rpcd."
+msgstr ""
+
+msgid "Subscription"
+msgstr ""
+
+msgid "Uploaded"
+msgstr ""
+
+msgid "Downloaded"
+msgstr ""
+
+msgid "Total"
+msgstr ""
+
+msgid "Remaining"
+msgstr ""
+
+msgid "Expires"
+msgstr ""
+
+msgid "Updated"
+msgstr ""
+
+msgid "Support"
+msgstr ""
+
+msgid "Website"
+msgstr ""
+
+msgid "Subscription metadata has not been received yet"
+msgstr ""
+
+msgid "TCP v4"
+msgstr ""
+
+msgid "TCP v6"
+msgstr ""
+
+msgid "UDP v4"
+msgstr ""
+
+msgid "UDP v6"
+msgstr ""
+
+msgid "Server"
+msgstr ""
+
+msgid "Ping"
+msgstr ""
+
+msgid "Status"
+msgstr ""
+
+msgid "Manual"
+msgstr ""
+
+msgid "In use"
+msgstr ""
+
+msgid "No data"
+msgstr ""
+
+msgid "Alive"
+msgstr ""
+
+msgid "Unavailable"
+msgstr ""
+
+msgid "Active: %s, alive: %s"
+msgstr ""
+
+msgid "Xray Extender"
+msgstr ""
+
+msgid "Subscription management, server health monitoring and balancer tools for luci-app-xray."
+msgstr ""
+
+msgid "Waiting for Xray restart…"
+msgstr ""
+
+msgid "Xray did not restart within the expected time."
+msgstr ""
+
+msgid "Subscriptions"
+msgstr ""
+
+msgid "Servers"
+msgstr ""
+
+msgid "Server Discovery"
+msgstr ""
+
+msgid "Balancers"
+msgstr ""
+
+msgid "Subscription Update"
+msgstr ""
+
+msgid "Checking daemon status…"
+msgstr ""
+
+msgid "Name"
+msgstr ""
+
+msgid "Role"
+msgstr ""
+
+msgid "Primary"
+msgstr ""
+
+msgid "Backup"
+msgstr ""
+
+msgid "URL"
+msgstr ""
+
+msgid "Enabled"
+msgstr ""
+
+msgid "Add New"
+msgstr ""
+
+msgid "Remove Missing"
+msgstr ""
+
+msgid "Interval"
+msgstr ""
+
+msgid "30 min"
+msgstr ""
+
+msgid "1 hour"
+msgstr ""
+
+msgid "6 hours"
+msgstr ""
+
+msgid "12 hours"
+msgstr ""
+
+msgid "1 day"
+msgstr ""
+
+msgid "Auto"
+msgstr ""
+
+msgid "Domain Resolution Strategy"
+msgstr ""
+
+msgid "Default values for newly added servers. Existing servers will not be affected by these settings."
+msgstr ""
+
+msgid "DNS Method"
+msgstr ""
+
+msgid "Used when a DNS server is specified below. Methods marked as \"direct\" bypass Xray for DNS queries."
+msgstr ""
+
+msgid "UDP"
+msgstr ""
+
+msgid "DNS over QUIC (direct)"
+msgstr ""
+
+msgid "TCP"
+msgstr ""
+
+msgid "TCP (direct)"
+msgstr ""
+
+msgid "DNS over HTTPS"
+msgstr ""
+
+msgid "DNS over HTTPS (direct)"
+msgstr ""
+
+msgid "DNS Server for Resolution"
+msgstr ""
+
+msgid "DNS server address in the format IP or IP:port. Existing servers will not be modified; these values will be used when adding new ones."
+msgstr ""
+
+msgid "Apply to All Servers"
+msgstr ""
+
+msgid "Overwrite Server Hostname Resolving settings for all xray_core servers."
+msgstr ""
+
+msgid "No servers found"
+msgstr ""
+
+msgid "Protocol"
+msgstr ""
+
+msgid "Transport"
+msgstr ""
+
+msgid "Address"
+msgstr ""
+
+msgid "Port"
+msgstr ""
+
+msgid "Unnamed"
+msgstr ""
+
+msgid "Loading balancer information..."
+msgstr ""
+
+msgid "Download subscriptions directly (bypass Xray)"
+msgstr ""
+
+msgid "When enabled, subscription URLs are fetched by the xrayext system user (UID 666), which is excluded from Xray transparent proxying. This keeps updates working when VPN tunnels are unavailable."
+msgstr ""
+

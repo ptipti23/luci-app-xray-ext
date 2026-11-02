@@ -1,0 +1,278 @@
+msgid "Queued…"
+msgstr "В очереди…"
+
+msgid "Waiting for WAN…"
+msgstr "Жду WAN…"
+
+msgid "Refreshing…"
+msgstr "Обновляю…"
+
+msgid "Refresh now"
+msgstr "Обновить сейчас"
+
+msgid "Ready to start. No update has been requested yet."
+msgstr "Готово к запуску. Обновление ещё не запрашивалось."
+
+msgid "Request accepted, waiting for execution…"
+msgstr "Запрос принят, ожидание выполнения…"
+
+msgid "WAN is unavailable. The request is waiting for the connection to be restored."
+msgstr "WAN недоступен. Запрос ждёт восстановления соединения."
+
+msgid "Subscription update: processed %d of %d; successful: %d, failed: %d."
+msgstr "Обновление подписок: обработано %d из %d; успешно: %d, ошибок: %d."
+
+msgid "Subscription update is in progress. Waiting for result data…"
+msgstr "Выполняется обновление подписок. Ожидаем данные о результате…"
+
+msgid "There are no enabled subscriptions to update."
+msgstr "Нет включённых подписок для обновления."
+
+msgid "Update completed: processed %d of %d; successful: %d, failed: %d."
+msgstr "Обновление завершено: обработано %d из %d; успешно: %d, ошибок: %d."
+
+msgid "Update completed with errors: processed %d of %d; successful: %d, failed: %d."
+msgstr "Обновление завершено с ошибками: обработано %d из %d; успешно: %d, ошибок: %d."
+
+msgid "Unknown update status."
+msgstr "Неизвестное состояние обновления."
+
+msgid "Completed: %s."
+msgstr "Завершено: %s."
+
+msgid "The request has been sent, but status polling is temporarily unavailable. The daemon may be busy with network processing; waiting for completion and automatically retrying…"
+msgstr "Запрос отправлен, но опрос состояния временно не отвечает. Возможно, демон занят сетевой обработкой; ждём итог и повторяем проверку автоматически…"
+
+msgid "Failed to read daemon status. Retrying automatically; if the error persists, check the xray_extd.status ACL and the connection to rpcd."
+msgstr "Не удалось прочитать состояние демона. Повторяем проверку; если ошибка повторяется, проверьте ACL xray_extd.status и соединение с rpcd."
+
+msgid "Sending…"
+msgstr "Отправляем…"
+
+msgid "Sending request to daemon…"
+msgstr "Отправляем запрос демону…"
+
+msgid "An update is already in progress. Connecting to its current status…"
+msgstr "Обновление уже выполняется. Подключаемся к его текущему состоянию…"
+
+msgid "The daemon did not accept the update request."
+msgstr "Демон не принял запрос на обновление."
+
+msgid "Failed to send the request. Check the xray_extd.refresh ACL and the connection to rpcd."
+msgstr "Не удалось отправить запрос. Проверьте ACL xray_extd.refresh и соединение с rpcd."
+
+msgid "Subscription"
+msgstr "Подписка"
+
+msgid "Uploaded"
+msgstr "Отдано"
+
+msgid "Downloaded"
+msgstr "Получено"
+
+msgid "Total"
+msgstr "Всего"
+
+msgid "Remaining"
+msgstr "Осталось"
+
+msgid "Expires"
+msgstr "Истекает"
+
+msgid "Updated"
+msgstr "Обновлено"
+
+msgid "Support"
+msgstr "Поддержка"
+
+msgid "Website"
+msgstr "Сайт"
+
+msgid "Subscription metadata has not been received yet"
+msgstr "Метаданные подписки пока не получены"
+
+msgid "TCP v4"
+msgstr "TCP v4"
+
+msgid "TCP v6"
+msgstr "TCP v6"
+
+msgid "UDP v4"
+msgstr "UDP v4"
+
+msgid "UDP v6"
+msgstr "UDP v6"
+
+msgid "Server"
+msgstr "Сервер"
+
+msgid "Ping"
+msgstr "Пинг"
+
+msgid "Status"
+msgstr "Состояние"
+
+msgid "Manual"
+msgstr "Ручной"
+
+msgid "In use"
+msgstr "используется"
+
+msgid "No data"
+msgstr "Нет данных"
+
+msgid "Alive"
+msgstr "Жив"
+
+msgid "Unavailable"
+msgstr "Недоступен"
+
+msgid "Active: %s, alive: %s"
+msgstr "Активно: %s, живых: %s"
+
+msgid "Xray Extender"
+msgstr "Расширение Xray"
+
+msgid "Subscription management, server health monitoring and balancer tools for luci-app-xray."
+msgstr "Управление подписками, мониторинг состояния серверов и инструменты балансировки для luci-app-xray."
+
+msgid "Waiting for Xray restart…"
+msgstr "Ожидание перезагрузки Xray…"
+
+msgid "Xray did not restart within the expected time."
+msgstr "Xray не перезагрузился в отведённое время."
+
+msgid "Subscriptions"
+msgstr "Подписки"
+
+msgid "Servers"
+msgstr "Серверы"
+
+msgid "Server Discovery"
+msgstr "Определение серверов"
+
+msgid "Balancers"
+msgstr "Балансировщики"
+
+msgid "Subscription Update"
+msgstr "Обновление подписок"
+
+msgid "Checking daemon status…"
+msgstr "Проверяем состояние демона…"
+
+msgid "Name"
+msgstr "Название"
+
+msgid "Role"
+msgstr "Роль"
+
+msgid "Primary"
+msgstr "Основной"
+
+msgid "Backup"
+msgstr "Резервный"
+
+msgid "URL"
+msgstr "URL"
+
+msgid "Enabled"
+msgstr "Вкл."
+
+msgid "Add New"
+msgstr "Добавлять новые"
+
+msgid "Remove Missing"
+msgstr "Удалять отсутствующие"
+
+msgid "Interval"
+msgstr "Интервал"
+
+msgid "30 min"
+msgstr "30 мин"
+
+msgid "1 hour"
+msgstr "1 час"
+
+msgid "6 hours"
+msgstr "6 часов"
+
+msgid "12 hours"
+msgstr "12 часов"
+
+msgid "1 day"
+msgstr "1 день"
+
+msgid "Auto"
+msgstr "Авто"
+
+msgid "Domain Resolution Strategy"
+msgstr "Стратегия разрешения домена"
+
+msgid "Default values for newly added servers. Existing servers will not be affected by these settings."
+msgstr "Значения по умолчанию для новых добавляемых серверов. Уже существующие серверы эти настройки не меняют."
+
+msgid "DNS Method"
+msgstr "Метод DNS"
+
+msgid "Used when a DNS server is specified below. Methods marked as \"direct\" bypass Xray for DNS queries."
+msgstr "Используется, когда указан DNS-сервер ниже. Методы с пометкой «напрямую» обходят Xray при запросе DNS."
+
+msgid "UDP"
+msgstr "UDP"
+
+msgid "DNS over QUIC (direct)"
+msgstr "DNS over QUIC (напрямую)"
+
+msgid "TCP"
+msgstr "TCP"
+
+msgid "TCP (direct)"
+msgstr "TCP (напрямую)"
+
+msgid "DNS over HTTPS"
+msgstr "DNS over HTTPS"
+
+msgid "DNS over HTTPS (direct)"
+msgstr "DNS over HTTPS (напрямую)"
+
+msgid "DNS Server for Resolution"
+msgstr "DNS-сервер для разрешения"
+
+msgid "DNS server address in the format IP or IP:port. Existing servers will not be modified; these values will be used when adding new ones."
+msgstr "Адрес DNS-сервера в формате IP или IP:порт. Текущие серверы не изменяются; эти значения будут использоваться при добавлении новых."
+
+msgid "Apply to All Servers"
+msgstr "Применить ко всем серверам"
+
+msgid "Overwrite Server Hostname Resolving settings for all xray_core servers."
+msgstr "Перезапишет параметры определения (Server Hostname Resolving) во всех серверах xray_core."
+
+msgid "No servers found"
+msgstr "Серверов не найдено"
+
+msgid "Protocol"
+msgstr "Протокол"
+
+msgid "Transport"
+msgstr "Транспорт"
+
+msgid "Address"
+msgstr "Адрес"
+
+msgid "Port"
+msgstr "Порт"
+
+msgid "Unnamed"
+msgstr "Без названия"
+
+msgid "Loading balancer information..."
+msgstr "Запуск обновления..."
+
+msgid "Download subscriptions directly (bypass Xray)"
+msgstr "Загружать подписки напрямую (в обход Xray)"
+
+msgid "When enabled, subscription URLs are fetched by the xrayext system user (UID 666), which is excluded from Xray transparent proxying. This keeps updates working when VPN tunnels are unavailable."
+msgstr "При включении подписки загружаются от имени системного пользователя xrayext (UID 666), исключённого из прозрачного проксирования Xray. Это позволяет обновлять подписки, даже когда VPN-туннели недоступны."
+
+msgid "The dedicated subscription downloader account is not installed correctly. Reinstall Xray Extender and try again."
+msgstr "Системная учётная запись загрузчика подписок установлена некорректно. Переустановите Xray Extender и повторите попытку."

@@ -1,0 +1,11 @@
+#!/bin/sh
+# First-boot setup for packages installed into a firmware image.
+# The normal IPK postinst skips configuration while IPKG_INSTROOT is set.
+
+if ! /usr/libexec/xray_extd/install_config.sh; then
+    logger -t xray_extd 'First-boot configuration failed; setup will be retried on the next boot'
+    exit 1
+fi
+
+/etc/init.d/xray_extd enable
+exit 0

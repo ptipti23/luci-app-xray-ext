@@ -1,0 +1,12 @@
+
+config general
+	option subscription_direct '0'
+	option domain_strategy 'UseIP'
+	option domain_resolve_dns_method 'udp'
+	option domain_resolve_dns ''
+	option failover_dead_confirm '3'
+	option failover_live_confirm '9'
+	option subscription_dead_confirm '3'
+	option subscription_live_confirm '9'
+	option backup_subscription_dead_confirm '3'
+	option backup_subscription_live_confirm '9'

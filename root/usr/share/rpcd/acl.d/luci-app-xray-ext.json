@@ -1,0 +1,45 @@
+{
+    "luci-app-xray-ext": {
+        "description": "Xray Extender",
+
+        "read": {
+            "uci": [
+                "xray_ext",
+                "xray_core"
+            ],
+            "ubus": {
+                "xray_extd": [
+                    "status"
+                ]
+            }
+        },
+
+        "write": {
+            "uci": [
+                "xray_ext",
+                "xray_core"
+            ],
+
+            "ubus": {
+                "file": [
+                    "*"
+                ],
+                "xray_extd": [
+                    "refresh"
+                ]
+            },
+
+            "file": {
+                "/usr/bin/xray": [
+                    "exec"
+                ],
+                "/bin/sh": [
+                    "exec"
+                ],
+                "/bin/cat": [
+                    "exec"
+                ]
+            }
+        }
+    }
+}
