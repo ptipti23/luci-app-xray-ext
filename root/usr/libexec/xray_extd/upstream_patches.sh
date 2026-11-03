@@ -1,6 +1,6 @@
 #!/bin/sh
 # Apply the two guarded luci-app-xray compatibility patches required by
-# Xray Extender. Safe to run repeatedly; unknown upstream layouts are not changed.
+# Xray Extended. Safe to run repeatedly; unknown upstream layouts are not changed.
 
 set -eu
 
@@ -22,11 +22,43 @@ require_file() {
     [ -r "$1" ] || fail "required upstream file is missing or unreadable: $1"
 }
 
-# Issue #520: keep system.mjs's balancer() unchanged for concrete outbound
-# enumeration. In gen_config.uc, alias that import for outbounds(), then add a
-# local balancer() wrapper used by routing.balancers[] to append the dynamic
-# <balancer>@balancer_outbound: prefix.
+# Issue #520: some upstream versions implement dynamic selectors in
+# feature/system.mjs as dynamic_balancer_selector(). In that layout the
+# upstream code already handles the required prefix and must not be rewritten.
+# Older versions need the guarded local-wrapper patch below.
+dynamic_selector_block() {
+    awk '
+        /export[[:space:]]+function[[:space:]]+dynamic_balancer_selector[[:space:]]*\(/ { active = 1 }
+        active { print }
+        active && /};/ { exit }
+    ' "$SYSTEM_MJS"
+}
+
+built_in_balancers_block() {
+    awk '
+        /function[[:space:]]+balancers[[:space:]]*\(/ { active = 1 }
+        active { print }
+        active && /function[[:space:]]+observatory[[:space:]]*\(/ { exit }
+    ' "$GEN_CONFIG"
+}
+
 check_gen_config() {
+    local selector_block dynamic_block
+
+    # Current upstream/fork layout: gen_config.uc delegates selector creation
+    # to dynamic_balancer_selector(), which returns the wildcard prefix
+    # <balancer>@balancer_outbound: for configured balancers.
+    selector_block="$(built_in_balancers_block)"
+    dynamic_block="$(dynamic_selector_block)"
+    if grep -Fq 'dynamic_balancer_selector' "$GEN_CONFIG" && \
+       printf '%s\n' "$selector_block" | grep -Eq '"selector"[[:space:]]*:[[:space:]]*dynamic_balancer_selector[[:space:]]*\([[:space:]]*proxy[[:space:]]*,[[:space:]]*balancer_tag[[:space:]]*,[[:space:]]*balancer_tag[[:space:]]*\)' && \
+       printf '%s\n' "$dynamic_block" | grep -Eq 'return[[:space:]]*\[[[:space:]]*"direct"[[:space:]]*\]' && \
+       printf '%s\n' "$dynamic_block" | grep -Eq 'return[[:space:]]*\[[[:space:]]*prefix[[:space:]]*\+[[:space:]]*"@balancer_outbound:"[[:space:]]*\]'; then
+        GEN_STATE='patched'
+        GEN_DETAIL='already implemented by dynamic_balancer_selector() in feature/system.mjs'
+        return 0
+    fi
+
     if grep -Fq 'balancer as balancer_outbounds' "$GEN_CONFIG" && \
        grep -Fq 'function balancer(proxy, balancer_tag, prefix)' "$GEN_CONFIG" && \
        grep -Fq '`${prefix}@balancer_outbound:`' "$GEN_CONFIG" && \
@@ -61,6 +93,7 @@ check_gen_config() {
     fi
 
     GEN_STATE='unsupported'
+    GEN_DETAIL=''
 }
 
 api_conf_block() {
@@ -319,7 +352,11 @@ require_file "$SYSTEM_MJS"
 check_gen_config
 check_system_mjs
 
-say "gen_config.uc (#520): $GEN_STATE"
+if [ -n "${GEN_DETAIL:-}" ]; then
+    say "gen_config.uc (#520): $GEN_STATE ($GEN_DETAIL)"
+else
+    say "gen_config.uc (#520): $GEN_STATE"
+fi
 say "feature/system.mjs (#523): $API_STATE"
 
 if [ "$ACTION" = 'check' ]; then
