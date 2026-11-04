@@ -6,6 +6,7 @@ set -eu
 
 GEN_CONFIG="${XRAY_EXT_GEN_CONFIG:-/usr/share/xray/gen_config.uc}"
 SYSTEM_MJS="${XRAY_EXT_SYSTEM_MJS:-/usr/share/xray/feature/system.mjs}"
+TLS_MJS="${XRAY_EXT_TLS_MJS:-/usr/share/xray/common/tls.mjs}"
 BACKUP_DIR="${XRAY_EXT_PATCH_BACKUP_DIR:-/etc/xray_ext/patch-backups}"
 ACTION="${1:-check}"
 
@@ -165,6 +166,38 @@ check_system_mjs() {
     API_STATE='needs-patch'
 }
 
+# Xray 26.10 no longer accepts the obsolete allowInsecure option.
+# If upstream removes it from tls_outbound_settings(), this check treats the
+# upstream implementation as already fixed and leaves the file untouched.
+tls_outbound_block() {
+    awk '
+        /export[[:space:]]+function[[:space:]]+tls_outbound_settings[[:space:]]*\(/ { active = 1 }
+        active {
+            print
+            if (/return[[:space:]]+result[[:space:]]*;/) exit
+        }
+    ' "$TLS_MJS"
+}
+
+check_tls_mjs() {
+    local block
+    block="$(tls_outbound_block)"
+
+    if [ -z "$block" ] || \
+       ! printf '%s\n' "$block" | grep -Fq 'serverName:' || \
+       ! printf '%s\n' "$block" | grep -Fq 'fingerprint:' || \
+       ! printf '%s\n' "$block" | grep -Eq 'return[[:space:]]+result[[:space:]]*;'; then
+        TLS_STATE='unsupported'
+        return 0
+    fi
+
+    if printf '%s\n' "$block" | grep -Eq 'allowInsecure[[:space:]]*:'; then
+        TLS_STATE='needs-patch'
+    else
+        TLS_STATE='patched'
+    fi
+}
+
 get_mode() {
     stat -c '%a' "$1" 2>/dev/null || printf '644\n'
 }
@@ -284,6 +317,49 @@ patch_gen_config() {
     say 'patch #520 applied: the original outbound helper is preserved; built-in balancer selectors also match dynamically added outbounds'
 }
 
+patch_tls_mjs() {
+    local tmp mode
+    tmp="${TLS_MJS}.xray-ext.$$"
+    mode="$(get_mode "$TLS_MJS")"
+
+    # Remove allowInsecure only from tls_outbound_settings(), not from any
+    # unrelated code elsewhere in the module.
+    awk '
+        /export[[:space:]]+function[[:space:]]+tls_outbound_settings[[:space:]]*\(/ {
+            active = 1
+            found = 1
+        }
+        active && /allowInsecure[[:space:]]*:/ {
+            removed++
+            next
+        }
+        {
+            print
+            if (active && /return[[:space:]]+result[[:space:]]*;/) {
+                active = 0
+                completed = 1
+            }
+        }
+        END {
+            if (!found || !completed || removed != 1) exit 2
+        }
+    ' "$TLS_MJS" > "$tmp" || {
+        rm -f "$tmp"
+        fail "could not safely patch $TLS_MJS (expected exactly one allowInsecure property in tls_outbound_settings())"
+    }
+
+    chmod "$mode" "$tmp" || {
+        rm -f "$tmp"
+        fail "could not preserve permissions on $TLS_MJS"
+    }
+    mv "$tmp" "$TLS_MJS" || {
+        rm -f "$tmp"
+        fail "could not install patched $TLS_MJS"
+    }
+
+    say 'TLS compatibility patch applied: obsolete allowInsecure option removed'
+}
+
 patch_system_mjs() {
     local tmp mode
     tmp="${SYSTEM_MJS}.xray-ext.$$"
@@ -348,9 +424,11 @@ patch_system_mjs() {
 
 require_file "$GEN_CONFIG"
 require_file "$SYSTEM_MJS"
+require_file "$TLS_MJS"
 
 check_gen_config
 check_system_mjs
+check_tls_mjs
 
 if [ -n "${GEN_DETAIL:-}" ]; then
     say "gen_config.uc (#520): $GEN_STATE ($GEN_DETAIL)"
@@ -358,9 +436,12 @@ else
     say "gen_config.uc (#520): $GEN_STATE"
 fi
 say "feature/system.mjs (#523): $API_STATE"
+say "common/tls.mjs (TLS compatibility): $TLS_STATE"
 
 if [ "$ACTION" = 'check' ]; then
-    [ "$GEN_STATE" = 'patched' ] && [ "$API_STATE" = 'patched' ] || exit 2
+    [ "$GEN_STATE" = 'patched' ] && \
+    [ "$API_STATE" = 'patched' ] && \
+    [ "$TLS_STATE" = 'patched' ] || exit 2
     say 'all required upstream patches are present'
     exit 0
 fi
@@ -371,6 +452,7 @@ fi
 # operation before any file is modified.
 [ "$GEN_STATE" != 'unsupported' ] || fail "unrecognized balancers() selector in $GEN_CONFIG; leaving it untouched"
 [ "$API_STATE" != 'unsupported' ] || fail "unrecognized api_conf() in $SYSTEM_MJS; leaving it untouched"
+[ "$TLS_STATE" != 'unsupported' ] || fail "unrecognized tls_outbound_settings() in $TLS_MJS; leaving it untouched"
 
 if [ "$GEN_STATE" = 'needs-patch' ]; then
     backup_file "$GEN_CONFIG"
@@ -382,8 +464,15 @@ if [ "$API_STATE" = 'needs-patch' ]; then
     patch_system_mjs
 fi
 
+if [ "$TLS_STATE" = 'needs-patch' ]; then
+    backup_file "$TLS_MJS"
+    patch_tls_mjs
+fi
+
 check_gen_config
 check_system_mjs
+check_tls_mjs
 [ "$GEN_STATE" = 'patched' ] || fail "verification failed for $GEN_CONFIG"
 [ "$API_STATE" = 'patched' ] || fail "verification failed for $SYSTEM_MJS"
+[ "$TLS_STATE" = 'patched' ] || fail "verification failed for $TLS_MJS"
 say 'all required upstream patches are present'

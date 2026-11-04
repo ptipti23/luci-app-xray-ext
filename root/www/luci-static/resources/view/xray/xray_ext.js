@@ -1031,6 +1031,10 @@ function buildOutbound(server, listName) {
     applySockopt(outbound, server);
     applyCustomConfig(outbound, server);
 
+    // Hysteria uses its own QUIC transport and must declare it explicitly.
+    if (server.protocol === 'hysteria')
+        outbound.streamSettings.network = 'hysteria';
+
     // Custom config may extend settings, but it must not change the generated
     // outbound identity or the mark reserved for Xray Extender.
     outbound.tag = listName + '@balancer_outbound:' + server['.name'];

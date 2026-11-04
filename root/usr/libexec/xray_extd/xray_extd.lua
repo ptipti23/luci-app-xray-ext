@@ -1336,6 +1336,10 @@ local function build_outbound(server, list_name)
         end
     end
 
+    -- Hysteria uses its own QUIC transport and must declare it explicitly.
+    if protocol == "hysteria" then
+        outbound.streamSettings.network = "hysteria"
+    end
 
     return outbound
 end
