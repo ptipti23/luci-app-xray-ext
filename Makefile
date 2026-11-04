@@ -1,3 +1,4 @@
+# call BuildPackage - OpenWrt buildroot signature
 include $(TOPDIR)/rules.mk
 
 LUCI_NAME:=luci-app-xray-ext
