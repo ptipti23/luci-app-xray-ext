@@ -700,37 +700,104 @@ function buildIndeterminateCfg() {
 
 
 /* =========================================================
+ * Получение PID процесса Xray
+ * =========================================================
+ */
+
+function getXrayPid() {
+
+    return exec('/bin/sh', [
+        '-c',
+        "pgrep -f '^/usr/bin/xray run '"
+    ])
+        .then(function(res) {
+
+            if (res.code !== 0) {
+                return Promise.reject(
+                    new Error('Xray process not found')
+                );
+            }
+
+            var pids = (res.stdout || '')
+                .trim()
+                .split(/\s+/)
+                .filter(function(pid) {
+                    return /^\d+$/.test(pid);
+                });
+
+            if (pids.length !== 1) {
+                return Promise.reject(
+                    new Error(
+                        'Expected one Xray process, found: ' +
+                        pids.length
+                    )
+                );
+            }
+
+            return pids[0];
+        });
+}
+
+
+/* =========================================================
  * Раздел: Ожидание перезапуска Xray
  * =========================================================
  */
 
-function waitForXrayRestart() {
+function waitForXrayRestart(oldPid) {
 
     var started = Date.now();
     var timeout = 30000;
-    var state = 'UP';
+    var newPid = null;
 
     return new Promise(function(resolve, reject) {
 
         function check() {
 
-            getRuntimeOutbounds(true)
+            getXrayPid()
+
+                .then(function(pid) {
+
+                    if (pid !== oldPid) {
+
+                        if (newPid !== pid) {
+
+                            newPid = pid;
+
+                            console.log(
+                                '[Xray wait] New PID detected:',
+                                oldPid,
+                                '->',
+                                newPid
+                            );
+                        }
+
+                        return getRuntimeOutbounds(true);
+                    }
+
+                    return null;
+                })
 
                 .then(function(result) {
 
-                    console.log(
-                        '[Xray wait]',
-                        'state=', state,
-                        'LSO=UP'
-                    );
-
-                    if (state === 'DOWN') {
+                    if (result !== null) {
 
                         console.log(
-                            '[Xray wait] Xray is UP again'
+                            '[Xray wait] New Xray process is ready'
                         );
 
                         resolve(result);
+                        return;
+                    }
+
+                    if (Date.now() - started >= timeout) {
+
+                        reject(
+                            new Error(
+                                'Xray restart timeout: new process not ready'
+                            )
+                        );
+
                         return;
                     }
 
@@ -739,22 +806,8 @@ function waitForXrayRestart() {
 
                 .catch(function(err) {
 
-                    console.log(
-                        '[Xray wait]',
-                        'state=', state,
-                        'LSO=DOWN'
-                    );
-
-                    if (state === 'UP') {
-
-                        state = 'DOWN';
-
-                        console.log(
-                            '[Xray wait] Xray went DOWN'
-                        );
-                    }
-
                     if (Date.now() - started >= timeout) {
+
                         reject(err);
                         return;
                     }
@@ -1030,10 +1083,6 @@ function buildOutbound(server, listName) {
     applySecurity(outbound, server);
     applySockopt(outbound, server);
     applyCustomConfig(outbound, server);
-
-    // Hysteria uses its own QUIC transport and must declare it explicitly.
-    if (server.protocol === 'hysteria')
-        outbound.streamSettings.network = 'hysteria';
 
     // Custom config may extend settings, but it must not change the generated
     // outbound identity or the mark reserved for Xray Extender.
@@ -2514,9 +2563,19 @@ console.log(data);
 		    );
 
 
-		    waitForXrayRestart()
+			getXrayPid()
 
-		        .then(function(result) {
+			    .then(function(oldPid) {
+
+			        console.log(
+			            '[Apply] Current Xray PID:',
+			            oldPid
+			        );
+
+			        return waitForXrayRestart(oldPid);
+			    })
+
+			    .then(function(result) {
 
 		            console.log(
 		                '[Apply] Xray restart detected',
