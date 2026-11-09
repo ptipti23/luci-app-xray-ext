@@ -1090,6 +1090,11 @@ function buildOutbound(server, listName) {
     outbound.streamSettings.sockopt = outbound.streamSettings.sockopt || {};
     outbound.streamSettings.sockopt.mark = 253;
 
+	// Hysteria uses its own QUIC transport and must declare it explicitly.
+	if (server.protocol === 'hysteria') {
+	    outbound.streamSettings.network = 'hysteria';
+	}
+
     return outbound;
 }
 
