@@ -184,6 +184,13 @@ var xrayExtdRemoveOutbound = rpc.declare({
     reject: true
 });
 
+var xrayExtdAddOutbound = rpc.declare({
+    object: 'xray_extd',
+    method: 'add_outbound',
+    params: [ 'outbound' ],
+    reject: true
+});
+
 var xrayExtdBalancerInfo = rpc.declare({
     object: 'xray_extd',
     method: 'balancer_info',
@@ -908,40 +915,37 @@ function removeOutbound(tag) {
 function addOutbound(jsonObj) {
     setServerCheckboxesDisabled(true);
 
-    var jsonStr = JSON.stringify({ outbounds: [ jsonObj ] });
+    console.log('ADD OUTBOUND:', jsonObj);
 
-    var tmpFile =
-        '/tmp/xray-ext-ado-' +
-        Date.now() +
-        '-' +
-        Math.floor(Math.random() * 100000) +
-        '.json';
-    console.log('ADO TEMP FILE:', tmpFile);
-
-    return exec('/bin/sh', [
-        '-c',
-        'printf "%s" "$1" > "$2" && ' +
-        '/usr/bin/xray api ado --server=127.0.0.1:8080 "$2"; ' +
-        'ret=$?; rm -f "$2"; exit $ret',
-        'sh',
-        jsonStr,
-        tmpFile
-    ])
+    return xrayExtdAddOutbound(jsonObj)
         .then(function(res) {
 
-            console.log('Xray add result:', res);
+            console.log('Xray Extender ADD RESULT:', res);
 
-            if (res.code !== 0) {
-                console.error('Xray add error:', res.stderr || res.stdout);
-                return Promise.reject(res);
+            if (!res || res.success !== true) {
+                var message = res && res.error
+                    ? res.error
+                    : 'Failed to add outbound: ' +
+                        (jsonObj && jsonObj.tag
+                            ? jsonObj.tag
+                            : 'unknown');
+
+                throw new Error(message);
             }
 
-            console.log('Xray add OK:', res.stdout);
+            console.log(
+                'Xray ADD VERIFIED:',
+                res.tag || jsonObj.tag
+            );
+
+            if (res.output)
+                console.log('Xray ADD OUTPUT:', res.output);
+
             return res;
         })
         .catch(function(err) {
-            console.error('Xray add ERROR:', err);
-            throw err;
+            console.error('Xray ADD ERROR:', err);
+            return false;
         })
         .finally(function() {
             setServerCheckboxesDisabled(false);

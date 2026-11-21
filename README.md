@@ -153,25 +153,13 @@ Place the following code in the `luci-app-xray` **Custom Configuration Hook**:
 
 ```javascript
 return function(config) {
-    if (
-        config.routing &&
-        Array.isArray(config.routing.balancers)
-    ) {
-        for (
-            let i = 0;
-            i < config.routing.balancers.length;
-            i++
-        ) {
-            let balancer = config.routing.balancers[i];
-
+    if (config.routing && config.routing.balancers) {
+        for (let balancer in config.routing.balancers) {
             if (
-                balancer &&
-                (
-                    balancer.tag == "tcp_outbound_v4" ||
-                    balancer.tag == "udp_outbound_v4" ||
-                    balancer.tag == "tcp_outbound_v6" ||
-                    balancer.tag == "udp_outbound_v6"
-                )
+                balancer.tag == "tcp_outbound_v4" ||
+                balancer.tag == "udp_outbound_v4" ||
+                balancer.tag == "tcp_outbound_v6" ||
+                balancer.tag == "udp_outbound_v6"
             ) {
                 balancer.fallbackTag = "blackhole_outbound";
             }
