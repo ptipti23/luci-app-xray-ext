@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible problem with Xray Extender.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check for an existing report first. **Do not post passwords, UUIDs, subscription URLs, private keys, tokens, or unredacted configuration/logs.**
+  - type: input
+    id: extender_version
+    attributes:
+      label: Xray Extender version
+      placeholder: e.g. 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: openwrt_version
+    attributes:
+      label: OpenWrt version and target
+      placeholder: e.g. OpenWrt 24.xx, ramips/mt7621
+    validations:
+      required: true
+  - type: input
+    id: xray_version
+    attributes:
+      label: Xray version
+      placeholder: e.g. 26.xx.x
+    validations:
+      required: false
+  - type: input
+    id: luci_xray_version
+    attributes:
+      label: luci-app-xray version
+      placeholder: Version, if installed/relevant
+    validations:
+      required: false
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the steps that reliably trigger the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or configuration
+      description: Include only the relevant, sanitized excerpts. Remove all secrets and identifying information.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Mention custom hooks, non-default settings, or anything else that may help reproduce the issue.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked for an existing report.
+          required: true
+        - label: I removed credentials, UUIDs, subscription URLs, tokens, private keys, and personal data from the information I provided.
+          required: true
