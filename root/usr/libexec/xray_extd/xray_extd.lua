@@ -3,8 +3,9 @@
 local uloop = require("uloop")
 local uci = require("uci")
 local ubus = require("ubus")
+local ubus_conn = ubus.connect()
 
-local VERSION = "0.4.9-backup-subscription-health-manual-ubus-runtime-snapshot-direct-subscriptions-json-subscriptions-duplicate-alias-indexing"
+local VERSION = "0.5.0-r2-backup-subscription-health-manual-ubus-runtime-snapshot-direct-subscriptions-json-subscriptions-duplicate-alias-indexing-async-parallel-subscription-refresh-timeout-sequential-apply-manual-ui-native-grpc-ado-ss2022-compact-ado-rmo-logs"
 local INTERVAL = 10000
 
 -- Persistent probe outbounds for backup TCP IPv4 subscription health checks.
@@ -66,27 +67,13 @@ local last_wan_up = nil
 
 -- Check OpenWrt's logical WAN state, not Internet reachability or a physical port.
 -- Fail closed: if ubus output is unavailable or invalid, pause daemon actions.
+-- Check OpenWrt's logical WAN state using the existing ubus connection.
+-- Fail closed: if ubus output is unavailable or invalid, pause daemon actions.
 local function is_wan_up()
-    local pipe = io.popen(
-        "ubus call network.interface.wan status 2>/dev/null"
-    )
+    local status = ubus_conn
+        and ubus_conn:call("network.interface.wan", "status", {})
 
-    if not pipe then
-        return false
-    end
-
-    local output = pipe:read("*a") or ""
-    pipe:close()
-
-    if output == "" then
-        return false
-    end
-
-    local ok, status = pcall(cjson.decode, output)
-
-    return ok
-        and type(status) == "table"
-        and status.up == true
+    return type(status) == "table" and status.up == true
 end
 
 -- Subscription parser is intentionally kept separate from the daemon.
@@ -592,24 +579,34 @@ local function mark_runtime_list_tag(tag, present)
     end
 end
 
+local xray_grpc = nil
 local function get_runtime_outbounds()
 
-    local ok, output, rc =
-        run_command(
-            "/usr/bin/xray api lso " ..
-            "--server=127.0.0.1:8080"
-        )
+
+    -- Load native gRPC module once.
+    if not xray_grpc then
+        local loaded, module = pcall(require, "xray_grpc")
+
+        if not loaded then
+            print("xray_extd: cannot load xray_grpc: " .. tostring(module))
+            return nil
+        end
+
+        xray_grpc = module
+    end
+
+    -- Get fresh outbound list directly from Xray API.
+    local ok, output, rc = xray_grpc.list_outbounds()
 
     if not ok then
-
         print(
-            "xray_extd: lso failed rc=" ..
+            "xray_extd: gRPC lso failed rc=" ..
             tostring(rc)
         )
 
         print(
-            "xray_extd: lso output: " ..
-            output
+            "xray_extd: gRPC lso output: " ..
+            tostring(output)
         )
 
         return nil
@@ -740,6 +737,49 @@ local function get_runtime_outbounds()
     publish_runtime_lists(result, false)
 
     return result
+end
+
+local function get_balancer_info(tag)
+    if type(tag) ~= "string" or tag == "" then
+        return nil, "Invalid balancer tag"
+    end
+
+    -- Ensure the native gRPC module is loaded.
+    if not xray_grpc then
+        local loaded, module = pcall(require, "xray_grpc")
+
+        if not loaded then
+            return nil, "Cannot load xray_grpc: " .. tostring(module)
+        end
+
+        xray_grpc = module
+    end
+
+    local ok, output, rc = xray_grpc.get_balancer_info(tag)
+
+    if not ok then
+        return nil, "GetBalancerInfo failed rc=" ..
+            tostring(rc) .. ": " .. tostring(output)
+    end
+
+    local decoded, data = pcall(cjson.decode, output)
+
+    if not decoded then
+        return nil, "Cannot parse GetBalancerInfo JSON"
+    end
+
+    local tags = data.principle_target and
+        data.principle_target.tag
+
+    if type(tags) ~= "table" then
+        return nil, "Missing principle_target.tag"
+    end
+
+    if type(tags[1]) ~= "string" or tags[1] == "" then
+        return nil, "No selected target"
+    end
+
+    return tags[1]
 end
 
 local function get_observatory_state(obs)
@@ -1390,9 +1430,137 @@ local function runtime_has_outbound(tag)
 end
 
 
+local function ado_log_value(value)
+    local text = tostring(value == nil and "" or value)
+    return (text:gsub("[%c]", " "))
+end
+
+
+local function ado_log_success(outbound, via, fallback_reason)
+
+    local protocol = tostring(outbound.protocol or "unknown")
+
+    local settings =
+        type(outbound.settings) == "table"
+        and outbound.settings or {}
+
+    local stream =
+        type(outbound.streamSettings) == "table"
+        and outbound.streamSettings or {}
+
+    local network = stream.network
+    local security = stream.security
+
+    local method = ""
+    local outbound_type = protocol
+
+
+    -- Shadowsocks 2022.
+    if protocol == "shadowsocks" then
+
+        method =
+            type(settings.method) == "string"
+            and settings.method or ""
+
+        if method:match("^2022%-") then
+            outbound_type = "shadowsocks-2022"
+        end
+    end
+
+
+    -- Hysteria uses QUIC internally.
+    -- Show its security rather than repeating the network name.
+    if protocol == "hysteria" then
+
+        if type(security) == "string"
+            and security ~= ""
+            and security ~= "none"
+        then
+            outbound_type =
+                outbound_type .. "+" .. security
+        else
+            outbound_type =
+                outbound_type .. "+quic"
+        end
+
+    else
+
+        if type(network) == "string"
+            and network ~= ""
+            and network ~= "none"
+        then
+            outbound_type =
+                outbound_type .. "+" .. network
+        end
+
+        if type(security) == "string"
+            and security ~= ""
+            and security ~= "none"
+        then
+            outbound_type =
+                outbound_type .. "+" .. security
+        end
+    end
+
+
+    -- Server endpoint.
+    local address = settings.address
+    local port = settings.port
+
+    local server = "unknown"
+
+    if type(address) == "string" and address ~= "" then
+
+        server = address
+
+        -- IPv6 address formatting.
+        if port ~= nil and tostring(port) ~= "" then
+
+            if server:find(":", 1, true)
+                and server:sub(1, 1) ~= "["
+            then
+                server = "[" .. server .. "]"
+            end
+
+            server = server .. ":" .. tostring(port)
+        end
+    end
+
+
+    local fields = {
+        "ADO OK: tag=" .. ado_log_value(outbound.tag),
+        "type=" .. ado_log_value(outbound_type),
+        "server=" .. ado_log_value(server)
+    }
+
+    if method ~= "" then
+        table.insert(
+            fields,
+            "method=" .. ado_log_value(method)
+        )
+    end
+
+    table.insert(fields, "via=" .. ado_log_value(via))
+
+    if fallback_reason and tostring(fallback_reason) ~= "" then
+        table.insert(
+            fields,
+            "fallback=" .. ado_log_value(fallback_reason)
+        )
+    end
+
+    table.insert(fields, "result=OK")
+
+    print(
+        "xray_extd: " .. table.concat(fields, ", ")
+    )
+end
+
+
 -- ============================================================
 -- Добавить outbound
 -- ============================================================
+
 
 local function xray_add_outbound(outbound)
 
@@ -1404,13 +1572,87 @@ local function xray_add_outbound(outbound)
         return false, "outbound tag is missing"
     end
 
-    local tmp_file =
-        "/tmp/xray-ext-ado-" ..
-        tostring(os.time()) ..
-        ".json"
+    -- ========================================================
+    -- Native gRPC ADO
+    -- ========================================================
 
-    local out_file =
-        tmp_file .. ".out"
+    -- Load native module if it has not been loaded yet.
+    if not xray_grpc then
+
+        local loaded, module = pcall(require, "xray_grpc")
+
+        if not loaded then
+            local err = "cannot load xray_grpc: " .. tostring(module)
+
+            print("xray_extd: ADO " .. err)
+
+            return false, err
+        end
+
+        xray_grpc = module
+    end
+
+    if type(xray_grpc.add_outbound) ~= "function" then
+        print("xray_extd: ADO native add_outbound is unavailable")
+
+        return false, "native add_outbound API is unavailable"
+    end
+
+    local call_ok, added, output, rc =
+        pcall(
+            xray_grpc.add_outbound,
+            outbound
+        )
+
+    if not call_ok then
+
+        print(
+            "xray_extd: ADO native Lua error: " ..
+            tostring(added)
+        )
+
+        return false,
+            "native ADO call failed: " .. tostring(added)
+    end
+
+
+    -- Native success.
+    if added and rc == 0 then
+
+        mark_runtime_list_tag(outbound.tag, true)
+
+        ado_log_success(outbound, "native")
+
+        return true, output or "OK"
+    end
+
+
+    -- Only unsupported configurations may use CLI.
+    if rc ~= 2 then
+
+        print(
+            "xray_extd: ADO native FAILED: tag=" ..
+            ado_log_value(outbound.tag) ..
+            ", rc=" ..
+            tostring(rc) ..
+            ", output=" ..
+            ado_log_value(output)
+        )
+
+        return false,
+            "native ADO failed (rc=" ..
+            tostring(rc) .. "): " ..
+            tostring(output)
+    end
+
+
+    -- Remember why native builder requested CLI fallback.
+    local fallback_reason = output
+
+
+    -- ========================================================
+    -- CLI fallback
+    -- ========================================================
 
     local payload = {
         outbounds = {
@@ -1430,6 +1672,35 @@ local function xray_add_outbound(outbound)
             tostring(json)
     end
 
+    -- Create a private root-owned directory (mode 0700).
+    -- xrayext cannot access or manipulate files inside it.
+    local temp_pipe = io.popen(
+        "/bin/mktemp -d /tmp/xray-ext-ado.XXXXXX",
+        "r"
+    )
+
+    if not temp_pipe then
+        return false,
+            "cannot create temporary directory"
+    end
+
+    local tmp_dir = temp_pipe:read("*l")
+    temp_pipe:close()
+
+    if not tmp_dir or tmp_dir == "" then
+        return false,
+            "mktemp failed to create temporary directory"
+    end
+
+    local tmp_file = tmp_dir .. "/request.json"
+    local out_file = tmp_dir .. "/response.out"
+
+    local function cleanup_ado_temp()
+        os.remove(tmp_file)
+        os.remove(out_file)
+        os.remove(tmp_dir)
+    end
+
     local file =
         io.open(
             tmp_file,
@@ -1437,20 +1708,30 @@ local function xray_add_outbound(outbound)
         )
 
     if not file then
+        cleanup_ado_temp()
+
         return false,
             "cannot create temporary file"
     end
 
-    file:write(json)
-    file:close()
+    local write_ok, write_error = file:write(json)
+    local close_ok, close_error = file:close()
+
+    if not write_ok or not close_ok then
+        cleanup_ado_temp()
+
+        return false,
+            "cannot write temporary file: " ..
+            tostring(write_error or close_error)
+    end
 
     local command =
         "/usr/bin/xray api ado " ..
         "--server=127.0.0.1:8080 " ..
-        "'" .. tmp_file .. "' " ..
-        ">" .. out_file .. " 2>&1"
+        shell_quote(tmp_file) ..
+        " >" .. shell_quote(out_file) .. " 2>&1"
 
-    local rc =
+    local cli_rc =
         os.execute(command)
 
     local result_file =
@@ -1459,41 +1740,51 @@ local function xray_add_outbound(outbound)
             "r"
         )
 
-    local output = ""
+    local cli_output = ""
 
     if result_file then
-        output =
+        cli_output =
             result_file:read("*a") or ""
 
         result_file:close()
     end
 
-    os.remove(tmp_file)
-    os.remove(out_file)
+    cleanup_ado_temp()
 
-    print(
-        "ADO tag=" ..
-        outbound.tag ..
-        " rc=" ..
-        tostring(rc)
-    )
+    if cli_rc ~= 0 then
 
-    if output ~= "" then
         print(
-            "ADO output=" ..
-            output
+            "xray_extd: ADO CLI FAILED: tag=" ..
+            ado_log_value(outbound.tag) ..
+            ", rc=" ..
+            tostring(cli_rc) ..
+            ", fallback=" ..
+            ado_log_value(fallback_reason) ..
+            ", output=" ..
+            ado_log_value(cli_output)
         )
-    end
 
-    if rc ~= 0 then
         return false,
-            "xray ado failed"
+            "xray ado CLI fallback failed (rc=" ..
+            tostring(cli_rc) .. "): " ..
+            ado_log_value(cli_output)
     end
 
     mark_runtime_list_tag(outbound.tag, true)
 
-    return true, output
+    ado_log_success(
+        outbound,
+        "cli",
+        fallback_reason
+    )
+
+    return true, cli_output
+
 end
+
+-- ============================================================
+-- Удалить outbound
+-- ============================================================
 
 local function xray_remove_outbound(tag)
 
@@ -1513,8 +1804,11 @@ local function xray_remove_outbound(tag)
     if not runtime then
 
         print(
-            "xray_extd: RMO cannot check runtime: " ..
-            tag
+            "xray_extd: RMO VERIFY ERROR: tag=" ..
+            ado_log_value(tag) ..
+            ", grpc_ok=" .. tostring(ok) ..
+            ", grpc_rc=" .. tostring(rc) ..
+            ", grpc_output=" .. ado_log_value(output)
         )
 
         return false
@@ -1531,32 +1825,9 @@ local function xray_remove_outbound(tag)
         return true
     end
 
-
-    local command =
-        "/usr/bin/xray api rmo " ..
-        "--server=127.0.0.1:8080 " ..
-        shell_quote(tag)
-
-
-    print(
-        "xray_extd: RMO request " ..
-        tag
-    )
-
-
     local ok, output, rc =
-        run_command(command)
+        xray_grpc.remove_outbound(tag)
 
-
-    print(
-        "xray_extd: RMO CLI rc=" ..
-        tostring(rc)
-    )
-
-    print(
-        "xray_extd: RMO CLI output: " ..
-        output
-    )
 
     -- Проверяем результат удаления только через lso.
 
@@ -1574,21 +1845,30 @@ local function xray_remove_outbound(tag)
         return false
     end
 
-
     if not runtime.tags[tag] then
 
         print(
-            "xray_extd: RMO VERIFIED " ..
-            tag
+            "xray_extd: RMO OK: tag=" ..
+            ado_log_value(tag) ..
+            ", via=native, result=OK"
+        )
+
+        print(
+            "xray_extd: RMO VERIFIED: " ..
+            ado_log_value(tag)
         )
 
         return true
     end
 
-
     print(
-        "xray_extd: RMO FAILED verification " ..
-        tag
+        "xray_extd: RMO FAILED: tag=" ..
+        ado_log_value(tag) ..
+        ", via=native" ..
+        ", grpc_ok=" .. tostring(ok) ..
+        ", grpc_rc=" .. tostring(rc) ..
+        ", grpc_output=" .. ado_log_value(output) ..
+        ", runtime=still-present"
     )
 
     return false
@@ -2016,6 +2296,22 @@ local SUBSCRIPTION_LIVE_CONFIRM = 9
 local pending_update_requests = {}
 local scheduled_update_requests = {}
 local last_subscription_fetch = {}
+
+-- Async subscription downloads
+local MAX_PARALLEL_SUBSCRIPTION_FETCHES = 3
+local SUBSCRIPTION_FETCH_TIMEOUT = 60
+local SUBSCRIPTION_FETCH_KILL_GRACE = 3
+
+local active_subscription_fetches = {}
+local active_subscription_fetch_count = 0
+
+-- Results are processed sequentially: PLAN -> APPLY -> COMMIT.
+local completed_subscription_fetches = {}
+local processing_subscription_fetch_results = false
+
+-- Keep references to asynchronous signal processes.
+local signal_processes = {}
+local signal_process_serial = 0
 
 -- Manual refresh is queued by the daemon's ubus API and processed by the
 -- existing subscription update pipeline from the normal heartbeat.
@@ -2854,14 +3150,62 @@ local function fetch_and_parse_subscription(sub, config)
     end
     os.remove(headers_path)
 
-    if body == "" then
-        return false, "wget returned an empty response"
+
+if body == "" then
+    print(
+        "xray_extd: wget returned empty body; " ..
+        "exit=" .. tostring(close_ok) ..
+        " reason=" .. tostring(close_reason or "") ..
+        " code=" .. tostring(close_code or "")
+    )
+
+    -- Log only safe diagnostic headers. Never expose cookies,
+    -- authorization data or redirect URLs containing tokens.
+    local safe_headers = {
+        ["content-length"] = true,
+        ["content-type"] = true,
+        ["transfer-encoding"] = true,
+        ["content-encoding"] = true,
+        ["connection"] = true,
+        ["date"] = true,
+        ["server"] = true,
+        ["retry-after"] = true
+    }
+
+    local logged = 0
+
+    for line in raw_headers:gmatch("[^\r\n]+") do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+
+        local header_name = line:match("^([%w%-]+):")
+        local lower_line = line:lower()
+
+        if line:match("^HTTP/[%d%.]+%s+%d+") then
+            print("xray_extd: wget HTTP status: " .. line)
+            logged = logged + 1
+        elseif header_name and safe_headers[header_name:lower()] then
+            print("xray_extd: wget HTTP header: " .. line)
+            logged = logged + 1
+        end
+    end
+
+    if logged == 0 then
+        print("xray_extd: wget returned no useful HTTP headers")
     end
 
     if close_ok == nil or close_ok == false then
         return false, "wget failed: " .. tostring(close_reason or "") ..
             " " .. tostring(close_code or "")
     end
+
+    return false, "wget returned an empty response"
+end
+
+if close_ok == nil or close_ok == false then
+    return false, "wget failed: " .. tostring(close_reason or "") ..
+        " " .. tostring(close_code or "")
+end
+
 
     local body_probe = body:gsub("^\239\187\191", ""):match("^%s*(.)")
     local selected_parser
@@ -3429,197 +3773,164 @@ process_pending_runtime_rebuilds = function(now)
     return pending
 end
 
+-- ============================================================
+-- Обработка результата загрузки подписки
+-- ============================================================
 
-local function flush_update_requests(config, now)
-    promote_due_update_requests(now)
-
-    for ext_id, request in pairs(pending_update_requests) do
-        local reasons = {}
-        for reason, _ in pairs(request.reasons) do
-            table.insert(reasons, reason)
-        end
-        table.sort(reasons)
-
-        print(
-            "xray_extd: UPDATE DECISION " ..
-            "ext_id=" .. ext_id ..
-            " name=" .. tostring(request.name) ..
-            " role=" .. request.role ..
-            " reasons=" .. table.concat(reasons, ",")
+local function process_subscription_fetch_result(
+    config,
+    ext_id,
+    request,
+    sub,
+    fetched,
+    result,
+    now
+)
+    if fetched then
+        local meta_ok, meta_saved, meta_error = pcall(
+            save_subscription_metadata,
+            ext_id,
+            result.metadata
         )
 
-        local sub = config.subscriptions[ext_id]
-        local is_manual_request = request.reasons[MANUAL_REFRESH_REASON] == true
-        local allowed =
-            (is_manual_request and subscription_can_manual_update(sub, request.role)) or
-            subscription_can_auto_update(sub, request.role)
-
-        if not allowed then
+        if not meta_ok then
             print(
-                "xray_extd: UPDATE SKIPPED ext_id=" .. ext_id ..
-                " reason=subscription is no longer enabled or eligible"
+                "xray_extd: subscription metadata save failed ext_id=" ..
+                ext_id ..
+                " error=" .. tostring(meta_saved)
             )
+        elseif not meta_saved then
+            print(
+                "xray_extd: subscription metadata save failed ext_id=" ..
+                ext_id ..
+                " error=" .. tostring(meta_error)
+            )
+        end
+
+        print(
+            "xray_extd: UPDATE FETCH/PARSE OK ext_id=" .. ext_id ..
+            " format=" .. result.format ..
+            " bytes=" .. tostring(result.bytes) ..
+            " servers=" .. tostring(result.server_count) ..
+            " unsupported=" .. tostring(result.unsupported) ..
+            " ignored=" .. tostring(result.ignored) ..
+            " safe_to_remove=" .. tostring(result.safe_to_remove)
+        )
+
+        local plan, plan_error = plan_subscription_update(
+            config,
+            ext_id,
+            sub,
+            result
+        )
+
+        if not plan then
+            print(
+                "xray_extd: UPDATE PLAN FAILED ext_id=" .. ext_id ..
+                " error=" .. tostring(plan_error) ..
+                "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
+            )
+
+            for reason, _ in pairs(request.reasons) do
+                queue_update_request(
+                    config,
+                    ext_id,
+                    reason,
+                    request.role,
+                    UPDATE_RETRY_DELAY
+                )
+            end
+
             finish_manual_refresh_target(ext_id, false)
         else
             print(
-                "xray_extd: UPDATE FETCH START ext_id=" .. ext_id ..
-                " name=" .. tostring(sub.name)
+                "xray_extd: UPDATE PLAN ext_id=" .. ext_id ..
+                " add=" .. tostring(plan.add) ..
+                " update=" .. tostring(plan.update) ..
+                " unchanged=" .. tostring(plan.unchanged) ..
+                " skipped=" .. tostring(plan.skipped) ..
+                " missing=" .. tostring(plan.missing) ..
+                " missing_mode=" .. tostring(plan.missing_mode) ..
+                " auto_remove=" .. tostring(sub.auto_remove) ..
+                " clear_missing=" .. tostring(plan.clear_missing) ..
+                " mark_missing=" .. tostring(plan.mark_missing) ..
+                " already_missing=" .. tostring(plan.already_missing) ..
+                " delete=" .. tostring(plan.delete) ..
+                (plan.missing_guarded and " missing_actions=blocked_unsafe_parse" or "")
             )
 
-            local fetched, result = fetch_and_parse_subscription(sub, config)
-            if fetched then
-                local meta_ok, meta_saved, meta_error = pcall(
-                    save_subscription_metadata,
-                    ext_id,
-                    result.metadata
-                )
-                if not meta_ok then
-                    print("xray_extd: subscription metadata save failed ext_id=" .. ext_id ..
-                        " error=" .. tostring(meta_saved))
-                elseif not meta_saved then
-                    print("xray_extd: subscription metadata save failed ext_id=" .. ext_id ..
-                        " error=" .. tostring(meta_error))
+            local printed = 0
+
+            for _, row in ipairs(plan.rows) do
+                if row.action ~= "skip" and printed < 20 then
+                    local detail = #row.fields > 0
+                        and table.concat(row.fields, ",")
+                        or "-"
+
+                    print(
+                        "xray_extd: UPDATE PLAN ITEM ext_id=" .. ext_id ..
+                        " action=" .. row.action ..
+                        " alias=" .. string.format("%q", row.alias) ..
+                        " alias_index=" .. tostring(row.alias_index or 1) ..
+                        " alias_count=" .. tostring(row.alias_count or 1) ..
+                        " fields=" .. detail
+                    )
+
+                    printed = printed + 1
                 end
+            end
 
+            if #plan.rows > printed then
                 print(
-                    "xray_extd: UPDATE FETCH/PARSE OK ext_id=" .. ext_id ..
-                    " format=" .. result.format ..
-                    " bytes=" .. tostring(result.bytes) ..
-                    " servers=" .. tostring(result.server_count) ..
-                    " unsupported=" .. tostring(result.unsupported) ..
-                    " ignored=" .. tostring(result.ignored) ..
-                    " safe_to_remove=" .. tostring(result.safe_to_remove)
+                    "xray_extd: UPDATE PLAN ITEM remaining=" ..
+                    tostring(#plan.rows - printed) ..
+                    " (details omitted)"
                 )
+            end
 
-                local plan, plan_error = plan_subscription_update(
+            for _, item in ipairs(plan.missing_details or {}) do
+                print(
+                    "xray_extd: UPDATE MISSING ITEM ext_id=" .. ext_id ..
+                    " action=" .. tostring(item.action) ..
+                    " alias=" .. string.format("%q", tostring(item.alias)) ..
+                    " alias_index=" .. tostring(item.alias_index or 1) ..
+                    " alias_count=" .. tostring(item.alias_count or 1) ..
+                    " section=" .. tostring(item.section)
+                )
+            end
+
+            local applied, apply_error, runtime_pending =
+                apply_subscription_plan(
                     config,
                     ext_id,
                     sub,
-                    result
+                    plan,
+                    now
                 )
 
-                if not plan then
-                    print(
-                        "xray_extd: UPDATE PLAN FAILED ext_id=" .. ext_id ..
-                        " error=" .. tostring(plan_error) ..
-                        "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
-                    )
+            if applied then
+                last_subscription_fetch[ext_id] = now
 
-                    for reason, _ in pairs(request.reasons) do
-                        queue_update_request(
-                            config,
-                            ext_id,
-                            reason,
-                            request.role,
-                            UPDATE_RETRY_DELAY
-                        )
-                    end
-                    finish_manual_refresh_target(ext_id, false)
-                else
-                    print(
-                        "xray_extd: UPDATE PLAN ext_id=" .. ext_id ..
-                        " add=" .. tostring(plan.add) ..
-                        " update=" .. tostring(plan.update) ..
-                        " unchanged=" .. tostring(plan.unchanged) ..
-                        " skipped=" .. tostring(plan.skipped) ..
-                        " missing=" .. tostring(plan.missing) ..
-                        " missing_mode=" .. tostring(plan.missing_mode) ..
-                        " auto_remove=" .. tostring(sub.auto_remove) ..
-                        " clear_missing=" .. tostring(plan.clear_missing) ..
-                        " mark_missing=" .. tostring(plan.mark_missing) ..
-                        " already_missing=" .. tostring(plan.already_missing) ..
-                        " delete=" .. tostring(plan.delete) ..
-                        (plan.missing_guarded and " missing_actions=blocked_unsafe_parse" or "")
-                    )
+                finish_manual_refresh_target(ext_id, true)
 
-                    local printed = 0
-                    for _, row in ipairs(plan.rows) do
-                        if row.action ~= "skip" and printed < 20 then
-                            local detail = #row.fields > 0
-                                and table.concat(row.fields, ",")
-                                or "-"
-                            print(
-                                "xray_extd: UPDATE PLAN ITEM ext_id=" .. ext_id ..
-                                " action=" .. row.action ..
-                                " alias=" .. string.format("%q", row.alias) ..
-                                " alias_index=" .. tostring(row.alias_index or 1) ..
-                                " alias_count=" .. tostring(row.alias_count or 1) ..
-                                " fields=" .. detail
-                            )
-                            printed = printed + 1
-                        end
-                    end
-
-                    if #plan.rows > printed then
-                        print(
-                            "xray_extd: UPDATE PLAN ITEM remaining=" ..
-                            tostring(#plan.rows - printed) ..
-                            " (details omitted)"
-                        )
-                    end
-
-                    for _, item in ipairs(plan.missing_details or {}) do
-                        print(
-                            "xray_extd: UPDATE MISSING ITEM ext_id=" .. ext_id ..
-                            " action=" .. tostring(item.action) ..
-                            " alias=" .. string.format("%q", tostring(item.alias)) ..
-                            " alias_index=" .. tostring(item.alias_index or 1) ..
-                            " alias_count=" .. tostring(item.alias_count or 1) ..
-                            " section=" .. tostring(item.section)
-                        )
-                    end
-
-                    local applied, apply_error, runtime_pending =
-                        apply_subscription_plan(config, ext_id, sub, plan, now)
-
-                    if applied then
-                        last_subscription_fetch[ext_id] = now
-                        finish_manual_refresh_target(ext_id, true)
-
-                        print(
-                            "xray_extd: UPDATE APPLIED ext_id=" .. ext_id ..
-                            " add=" .. tostring(plan.add) ..
-                            " update=" .. tostring(plan.update) ..
-                            " unchanged=" .. tostring(plan.unchanged) ..
-                            " skipped=" .. tostring(plan.skipped) ..
-                            " missing=" .. tostring(plan.missing) ..
-                            " missing_mode=" .. tostring(plan.missing_mode) ..
-                            " clear_missing=" .. tostring(plan.clear_missing) ..
-                            " mark_missing=" .. tostring(plan.mark_missing) ..
-                            " already_missing=" .. tostring(plan.already_missing) ..
-                            " delete=" .. tostring(plan.delete) ..
-                            " runtime_sync_pending=" .. tostring(runtime_pending)
-                        )
-                    else
-                        print(
-                            "xray_extd: UPDATE APPLY FAILED ext_id=" .. ext_id ..
-                            " error=" .. tostring(apply_error) ..
-                            "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
-                        )
-
-                        for reason, _ in pairs(request.reasons) do
-                            queue_update_request(
-                                config,
-                                ext_id,
-                                reason,
-                                request.role,
-                                UPDATE_RETRY_DELAY
-                            )
-                        end
-                        finish_manual_refresh_target(ext_id, false)
-                    end
-                end
-
-                if result.safe_to_remove ~= true then
-                    print(
-                        "xray_extd: UPDATE SAFETY ext_id=" .. ext_id ..
-                        " missing-server actions blocked because feed is not fully understood"
-                    )
-                end
+                print(
+                    "xray_extd: UPDATE APPLIED ext_id=" .. ext_id ..
+                    " add=" .. tostring(plan.add) ..
+                    " update=" .. tostring(plan.update) ..
+                    " unchanged=" .. tostring(plan.unchanged) ..
+                    " skipped=" .. tostring(plan.skipped) ..
+                    " missing=" .. tostring(plan.missing) ..
+                    " missing_mode=" .. tostring(plan.missing_mode) ..
+                    " clear_missing=" .. tostring(plan.clear_missing) ..
+                    " mark_missing=" .. tostring(plan.mark_missing) ..
+                    " already_missing=" .. tostring(plan.already_missing) ..
+                    " delete=" .. tostring(plan.delete) ..
+                    " runtime_sync_pending=" .. tostring(runtime_pending)
+                )
             else
                 print(
-                    "xray_extd: UPDATE FETCH/PARSE FAILED ext_id=" .. ext_id ..
-                    " error=" .. tostring(result) ..
+                    "xray_extd: UPDATE APPLY FAILED ext_id=" .. ext_id ..
+                    " error=" .. tostring(apply_error) ..
                     "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
                 )
 
@@ -3632,13 +3943,674 @@ local function flush_update_requests(config, now)
                         UPDATE_RETRY_DELAY
                     )
                 end
+
                 finish_manual_refresh_target(ext_id, false)
+            end
+        end
+
+        if result.safe_to_remove ~= true then
+            print(
+                "xray_extd: UPDATE SAFETY ext_id=" .. ext_id ..
+                " missing-server actions blocked because feed is not fully understood"
+            )
+        end
+    else
+        print(
+            "xray_extd: UPDATE FETCH/PARSE FAILED ext_id=" .. ext_id ..
+            " error=" .. tostring(result) ..
+            "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
+        )
+
+        for reason, _ in pairs(request.reasons) do
+            queue_update_request(
+                config,
+                ext_id,
+                reason,
+                request.role,
+                UPDATE_RETRY_DELAY
+            )
+        end
+
+        finish_manual_refresh_target(ext_id, false)
+    end
+end
+
+-- ============================================================
+-- Асинхронная загрузка подписок
+-- ============================================================
+
+local dispatch_pending_subscription_fetches
+local process_completed_subscription_fetches
+
+
+local function allocate_subscription_temp_path()
+    local path = os.tmpname()
+
+    if not path or path == "" then
+        return nil
+    end
+
+    os.remove(path)
+    return path
+end
+
+
+local function read_subscription_temp_file(path)
+    local file = io.open(path, "r")
+
+    if not file then
+        return ""
+    end
+
+    local data = file:read("*a") or ""
+    file:close()
+
+    return data
+end
+
+
+-- Запустить отправку сигнала процессу, не блокируя uloop.
+local function send_subscription_signal(job, signal)
+    if not job.process then
+        return false
+    end
+
+    local pid = job.process:pid()
+
+    if not pid then
+        return false
+    end
+
+    signal_process_serial = signal_process_serial + 1
+    local signal_id = signal_process_serial
+
+    local ok, proc = pcall(
+        uloop.process,
+        "/bin/kill",
+        {"-" .. signal, tostring(pid)},
+        {},
+        function(exit_code)
+            signal_processes[signal_id] = nil
+
+            if exit_code ~= 0 then
+                print(
+                    "xray_extd: subscription signal failed " ..
+                    "ext_id=" .. job.ext_id ..
+                    " signal=" .. signal ..
+                    " exit_code=" .. tostring(exit_code)
+                )
+            end
+        end
+    )
+
+    if not ok or not proc then
+        print(
+            "xray_extd: cannot send subscription signal " ..
+            "ext_id=" .. job.ext_id ..
+            " signal=" .. signal ..
+            " error=" .. tostring(proc)
+        )
+        return false
+    end
+
+    signal_processes[signal_id] = proc
+
+    return true
+end
+
+local function classify_wget_failure(stderr)
+    stderr = tostring(stderr or "")
+    local lower = stderr:lower()
+
+    local http_status =
+        stderr:match("HTTP/%d%.%d%s+(%d%d%d)") or
+        stderr:match("ERROR%s+(%d%d%d):")
+
+    if http_status then
+        return "http_status=" .. http_status
+    end
+
+    local patterns = {
+        {"unable to resolve host", "dns_resolution_failed"},
+        {"temporary failure in name resolution", "dns_resolution_failed"},
+        {"connection timed out", "connection_timeout"},
+        {"timed out", "connection_timeout"},
+        {"connection refused", "connection_refused"},
+        {"connection reset", "connection_reset"},
+        {"network is unreachable", "network_unreachable"},
+        {"no route to host", "no_route_to_host"},
+        {"certificate", "tls_certificate_error"},
+        {"gnutls", "tls_error"},
+        {"ssl", "tls_error"},
+        {"handshake failed", "tls_handshake_failed"}
+    }
+
+    for _, item in ipairs(patterns) do
+        if lower:find(item[1], 1, true) then
+            return item[2]
+        end
+    end
+
+    return "unclassified_stderr_bytes=" .. tostring(#stderr)
+end
+
+-- Прочитать и разобрать уже скачанные файлы.
+local function parse_subscription_download(job, exit_code)
+	local body = read_subscription_temp_file(job.body_path)
+	local raw_headers = read_subscription_temp_file(job.headers_path)
+
+	local wget_failure = nil
+
+	if exit_code ~= 0 then
+	    wget_failure = classify_wget_failure(raw_headers)
+	end
+
+	os.remove(job.body_path)
+	os.remove(job.headers_path)
+
+	if job.pid_path then
+	    os.remove(job.pid_path)
+	end
+
+    if job.timed_out then
+        return false,
+            "wget timed out after " ..
+            tostring(SUBSCRIPTION_FETCH_TIMEOUT) .. " seconds"
+    end
+
+	if exit_code ~= 0 then
+	    return false,
+	        "wget failed: exit_code=" .. tostring(exit_code) ..
+	        "; " .. tostring(wget_failure)
+	end
+
+    if body == "" then
+        return false, "wget returned an empty response"
+    end
+
+    local body_probe =
+        body:gsub("^\239\187\191", ""):match("^%s*(.)")
+
+    local selected_parser
+
+    if body_probe == "[" or body_probe == "{" then
+        selected_parser = subscription_json_parser
+
+        if not selected_parser then
+            return false, "JSON subscription parser is unavailable"
+        end
+    else
+        selected_parser = subscription_parser
+
+        if not selected_parser then
+            return false, "subscription parser is unavailable"
+        end
+    end
+
+    local parse_ok, servers, info_or_error = pcall(
+        selected_parser.parse,
+        body
+    )
+
+    if not parse_ok then
+        return false,
+            "parser raised an error: " .. tostring(servers)
+    end
+
+    if not servers then
+        return false,
+            "parser rejected feed: " .. tostring(info_or_error)
+    end
+
+    local info = info_or_error or {}
+
+    if #servers == 0 then
+        return false, "parser returned zero supported servers"
+    end
+
+    return true, {
+        bytes = #body,
+        server_count = #servers,
+        parsed_servers = servers,
+        format = tostring(info.format or "unknown"),
+        unsupported = tonumber(info.unsupported) or 0,
+        ignored = tonumber(info.ignored) or 0,
+        safe_to_remove = info.safe_to_remove == true,
+        metadata = parse_subscription_response_headers(raw_headers)
+    }
+end
+
+
+-- Запустить одну загрузку.
+local function start_subscription_download(
+    ext_id,
+    request,
+    sub,
+    config
+)
+    local body_path = allocate_subscription_temp_path()
+
+    if not body_path then
+        return nil, "cannot allocate temporary body file"
+    end
+
+    local headers_path = allocate_subscription_temp_path()
+
+    local pid_path = nil
+
+    if config and config.subscription_direct then
+        pid_path = allocate_subscription_temp_path()
+
+        if not pid_path then
+            os.remove(body_path)
+            os.remove(headers_path)
+            return nil, "cannot allocate temporary PID file"
+        end
+    end
+
+    if not headers_path then
+        os.remove(body_path)
+        return nil, "cannot allocate temporary headers file"
+    end
+
+    local wget_command =
+        "/usr/bin/wget -S -T 20 -t 1 -O - " ..
+        shell_quote(sub.url)
+
+    if config and config.subscription_direct then
+		wget_command =
+		    "/sbin/start-stop-daemon -S -m -p " ..
+		    shell_quote(pid_path) ..
+		    " -c xrayext:xrayext " ..
+		    "-x /usr/bin/wget -- --no-hsts -S -T 20 -t 1 -O - " ..
+		    shell_quote(sub.url)
+    end
+
+    -- Shell opens both files before executing wget.
+    -- Therefore the direct-mode wget can write to them as xrayext.
+    local command =
+        "exec " .. wget_command ..
+        " >" .. shell_quote(body_path) ..
+        " 2>" .. shell_quote(headers_path)
+
+    local job = {
+        ext_id = tostring(ext_id),
+        request = request,
+        sub_url = sub.url,
+        sub_name = sub.name,
+
+        body_path = body_path,
+        headers_path = headers_path,
+        pid_path = pid_path,
+
+        process = nil,
+        process_done = false,
+        timed_out = false
+    }
+
+    local process_ok, proc = pcall(
+        uloop.process,
+        "/bin/sh",
+        {"-c", command},
+        {},
+        function(exit_code)
+            if job.process_done then
+                return
+            end
+
+            job.process_done = true
+
+            if job.deadline_timer then
+                job.deadline_timer:cancel()
+                job.deadline_timer = nil
+            end
+
+            if job.kill_timer then
+                job.kill_timer:cancel()
+                job.kill_timer = nil
+            end
+
+            active_subscription_fetch_count =
+                math.max(0, active_subscription_fetch_count - 1)
+
+            job.process = nil
+
+            local parse_ok, fetched, result = pcall(
+                parse_subscription_download,
+                job,
+                exit_code
+            )
+
+			if not parse_ok then
+			    local parse_error = fetched
+			    fetched = false
+			    result = "download parser error: " .. tostring(parse_error)
+			end
+
+            table.insert(
+                completed_subscription_fetches,
+                {
+                    job = job,
+                    fetched = fetched,
+                    result = result
+                }
+            )
+
+            -- Sequential result processing. No two Lua callbacks
+            -- can execute APPLY/COMMIT simultaneously.
+            process_completed_subscription_fetches()
+
+            -- A free download slot may now be available.
+            local current_config = read_xray_config()
+
+            if current_config then
+                dispatch_pending_subscription_fetches(
+                    current_config,
+                    os.time()
+                )
+            end
+
+            finish_manual_refresh_if_complete()
+        end
+    )
+
+    if not process_ok or not proc then
+        os.remove(body_path)
+        os.remove(headers_path)
+		if pid_path then
+		    os.remove(pid_path)
+		end
+
+        return nil, tostring(proc or "uloop.process failed")
+    end
+
+    job.process = proc
+
+    -- Absolute deadline, independent of wget's network inactivity timeout.
+    job.deadline_timer = uloop.timer(function()
+        if job.process_done then
+            return
+        end
+
+        job.timed_out = true
+
+        print(
+            "xray_extd: UPDATE FETCH TIMEOUT ext_id=" .. job.ext_id ..
+            " timeout=" .. tostring(SUBSCRIPTION_FETCH_TIMEOUT) ..
+            "; sending TERM"
+        )
+
+        send_subscription_signal(job, "TERM")
+
+        -- Give wget time to exit gracefully, then force termination.
+        job.kill_timer = uloop.timer(function()
+            if job.process_done then
+                return
+            end
+
+            print(
+                "xray_extd: UPDATE FETCH FORCE KILL ext_id=" .. job.ext_id
+            )
+
+            send_subscription_signal(job, "KILL")
+        end, SUBSCRIPTION_FETCH_KILL_GRACE * 1000)
+
+    end, SUBSCRIPTION_FETCH_TIMEOUT * 1000)
+
+    return job
+end
+
+
+-- ============================================================
+-- Последовательная обработка завершившихся загрузок
+-- ============================================================
+
+process_completed_subscription_fetches = function()
+    if processing_subscription_fetch_results then
+        return
+    end
+
+    processing_subscription_fetch_results = true
+
+    while #completed_subscription_fetches > 0 do
+        local item = table.remove(completed_subscription_fetches, 1)
+        local job = item.job
+        local ext_id = job.ext_id
+
+        local ok, process_error = pcall(function()
+            -- Always use the latest UCI state when planning/applying.
+            local current_config = read_xray_config()
+
+            if not current_config then
+                print(
+                    "xray_extd: UPDATE RESULT FAILED ext_id=" .. ext_id ..
+                    " reason=cannot read current config"
+                )
+
+                finish_manual_refresh_target(ext_id, false)
+                return
+            end
+
+            local sub =
+                current_config.subscriptions and
+                current_config.subscriptions[ext_id]
+
+            local is_manual_request =
+                job.request.reasons[MANUAL_REFRESH_REASON] == true
+
+            local allowed =
+                sub and (
+                    (is_manual_request and
+                        subscription_can_manual_update(sub, sub.role)) or
+                    subscription_can_auto_update(sub, sub.role)
+                )
+
+            if not allowed then
+                print(
+                    "xray_extd: UPDATE RESULT SKIPPED ext_id=" .. ext_id ..
+                    " reason=subscription is no longer enabled or eligible"
+                )
+
+                finish_manual_refresh_target(ext_id, false)
+                return
+            end
+
+            -- Do not apply a feed downloaded from an old URL.
+            if sub.url ~= job.sub_url then
+                print(
+                    "xray_extd: UPDATE URL CHANGED ext_id=" .. ext_id ..
+                    "; scheduling a fresh download"
+                )
+
+                for reason, _ in pairs(job.request.reasons) do
+                    queue_update_request(
+                        current_config,
+                        ext_id,
+                        reason,
+                        sub.role,
+                        0
+                    )
+                end
+
+                return
+            end
+
+            job.request.name = sub.name
+            job.request.role = sub.role
+
+            process_subscription_fetch_result(
+                current_config,
+                ext_id,
+                job.request,
+                sub,
+                item.fetched,
+                item.result,
+                os.time()
+            )
+        end)
+
+        if not ok then
+            print(
+                "xray_extd: UPDATE RESULT CALLBACK FAILED ext_id=" .. ext_id ..
+                " error=" .. tostring(process_error)
+            )
+
+            local retry_config = read_xray_config()
+            local retry_sub =
+                retry_config and
+                retry_config.subscriptions and
+                retry_config.subscriptions[ext_id]
+
+            if retry_config and retry_sub then
+                for reason, _ in pairs(job.request.reasons) do
+                    queue_update_request(
+                        retry_config,
+                        ext_id,
+                        reason,
+                        retry_sub.role,
+                        UPDATE_RETRY_DELAY
+                    )
+                end
+            end
+
+            finish_manual_refresh_target(ext_id, false)
+        end
+
+        active_subscription_fetches[ext_id] = nil
+    end
+
+    processing_subscription_fetch_results = false
+
+    finish_manual_refresh_if_complete()
+end
+
+
+-- ============================================================
+-- Запуск ожидающих загрузок с ограничением параллельности
+-- ============================================================
+
+dispatch_pending_subscription_fetches = function(config, now)
+    promote_due_update_requests(now)
+
+    local ext_ids = {}
+
+    for ext_id, _ in pairs(pending_update_requests) do
+        table.insert(ext_ids, tostring(ext_id))
+    end
+
+    table.sort(ext_ids)
+
+    for _, ext_id in ipairs(ext_ids) do
+        local request = pending_update_requests[ext_id]
+
+        if request then
+            local active = active_subscription_fetches[ext_id]
+
+            if active then
+                -- A new reason arrived while this subscription was downloading.
+                -- Merge it into the existing request instead of downloading twice.
+                for reason, _ in pairs(request.reasons) do
+                    active.request.reasons[reason] = true
+                end
+
+                pending_update_requests[ext_id] = nil
+            else
+                local sub =
+                    config.subscriptions and
+                    config.subscriptions[ext_id]
+
+                local is_manual_request =
+                    request.reasons[MANUAL_REFRESH_REASON] == true
+
+                local allowed =
+                    (is_manual_request and
+                        subscription_can_manual_update(sub, sub and sub.role)) or
+                    subscription_can_auto_update(sub, sub and sub.role)
+
+                if not allowed then
+                    pending_update_requests[ext_id] = nil
+
+                    print(
+                        "xray_extd: UPDATE SKIPPED ext_id=" .. ext_id ..
+                        " reason=subscription is no longer enabled or eligible"
+                    )
+
+                    finish_manual_refresh_target(ext_id, false)
+
+                elseif active_subscription_fetch_count <
+                    MAX_PARALLEL_SUBSCRIPTION_FETCHES then
+
+                    local reasons = {}
+
+                    for reason, _ in pairs(request.reasons) do
+                        table.insert(reasons, reason)
+                    end
+
+                    table.sort(reasons)
+
+                    request.name = sub.name
+                    request.role = sub.role
+
+                    print(
+                        "xray_extd: UPDATE DECISION " ..
+                        "ext_id=" .. ext_id ..
+                        " name=" .. tostring(request.name) ..
+                        " role=" .. tostring(request.role) ..
+                        " reasons=" .. table.concat(reasons, ",")
+                    )
+
+                    print(
+                        "xray_extd: UPDATE FETCH START ext_id=" .. ext_id ..
+                        " name=" .. tostring(sub.name) ..
+                        " mode=async"
+                    )
+
+                    pending_update_requests[ext_id] = nil
+
+                    local job, start_error =
+                        start_subscription_download(
+                            ext_id,
+                            request,
+                            sub,
+                            config
+                        )
+
+                    if job then
+                        active_subscription_fetches[ext_id] = job
+                        active_subscription_fetch_count =
+                            active_subscription_fetch_count + 1
+                    else
+                        print(
+                            "xray_extd: UPDATE FETCH START FAILED ext_id=" ..
+                            ext_id ..
+                            " error=" .. tostring(start_error) ..
+                            "; retrying in " ..
+                            tostring(UPDATE_RETRY_DELAY) .. " seconds"
+                        )
+
+                        for reason, _ in pairs(request.reasons) do
+                            queue_update_request(
+                                config,
+                                ext_id,
+                                reason,
+                                request.role,
+                                UPDATE_RETRY_DELAY
+                            )
+                        end
+
+                        finish_manual_refresh_target(ext_id, false)
+                    end
+                end
+                -- If all slots are occupied, leave this request pending.
             end
         end
     end
 
-    pending_update_requests = {}
     finish_manual_refresh_if_complete()
+end
+
+local function flush_update_requests(config, now)
+    dispatch_pending_subscription_fetches(config, now)
 end
 
 
@@ -4399,7 +5371,6 @@ local function heartbeat()
 end
 
 
-local ubus_conn = ubus.connect()
 if ubus_conn then
     local control_object = {
         xray_extd = {
@@ -4455,6 +5426,100 @@ if ubus_conn then
                     })
                 end,
                 {}
+            },
+            outbounds = {
+                function(req, msg)
+                    local result = get_runtime_outbounds()
+
+                    if not result then
+                        ubus_conn:reply(req, {
+                            success = false,
+                            error = "Failed to get runtime outbounds"
+                        })
+                        return
+                    end
+
+                    ubus_conn:reply(req, result)
+                end,
+                {}
+            },
+            balancer_info = {
+                function(req, msg)
+                    local tag = msg and msg.tag
+
+                    if type(tag) ~= "string" or tag == "" then
+                        ubus_conn:reply(req, {
+                            success = false,
+                            error = "Invalid balancer tag"
+                        })
+                        return
+                    end
+
+                    local selected, err = get_balancer_info(tag)
+
+                    ubus_conn:reply(req, {
+                        success = type(selected) == "string" and selected ~= "",
+                        selected = selected,
+                        error = err
+                    })
+                end,
+                {}
+            },
+            add_outbound = {
+                function(req, msg)
+                    local outbound = msg and msg.outbound
+
+                    if type(outbound) ~= "table" then
+                        ubus_conn:reply(req, {
+                            success = false,
+                            error = "Invalid outbound"
+                        })
+                        return
+                    end
+
+                    local ok, result = xray_add_outbound(outbound)
+
+                    local response = {
+                        success = ok,
+                        tag = outbound.tag
+                    }
+
+                    if ok then
+                        response.output = result
+                    else
+                        response.error = result or "Failed to add outbound"
+                    end
+
+                    ubus_conn:reply(req, response)
+                end,
+                {}
+            },
+            remove_outbound = {
+                function(req, msg)
+                    local tag = msg and msg.tag
+
+                    if type(tag) ~= "string" or tag == "" then
+                        ubus_conn:reply(req, {
+                            success = false,
+                            error = "Invalid outbound tag"
+                        })
+                        return
+                    end
+
+                    local ok = xray_remove_outbound(tag)
+
+                    local response = {
+                        success = ok,
+                        tag = tag
+                    }
+
+                    if not ok then
+                        response.error = "Failed to remove outbound"
+                    end
+
+                    ubus_conn:reply(req, response)
+                end,
+                {}
             }
         }
     }
@@ -4464,7 +5529,7 @@ if ubus_conn then
     end)
 
     if add_ok then
-        print("xray_extd: ubus control API ready (xray_extd.refresh/status)")
+        print("xray_extd: ubus control API ready (xray_extd.refresh/status/outbounds/add_outbound/remove_outbound)")
     else
         print("xray_extd: failed to register ubus control API: " .. tostring(add_error))
     end
@@ -4487,6 +5552,35 @@ local function stop(signo)
         "xray_extd: stopping, signal=" ..
         tostring(signo)
     )
+
+    -- Do not leave subscription downloads running after daemon shutdown.
+    for _, job in pairs(active_subscription_fetches) do
+        if job.process and not job.process_done then
+            local pid = tonumber(job.process:pid())
+
+            if pid then
+                os.execute(
+                    "/bin/kill -KILL " ..
+                    tostring(pid) ..
+                    " >/dev/null 2>&1"
+                )
+            end
+        end
+
+        if job.deadline_timer then
+            job.deadline_timer:cancel()
+        end
+
+        if job.kill_timer then
+            job.kill_timer:cancel()
+        end
+
+        os.remove(job.body_path)
+        os.remove(job.headers_path)
+		if job.pid_path then
+		    os.remove(job.pid_path)
+		end
+    end
 
     timer:cancel()
     uloop.cancel()

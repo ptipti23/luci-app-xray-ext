@@ -4,10 +4,11 @@ include $(TOPDIR)/rules.mk
 LUCI_NAME:=luci-app-xray-ext
 LUCI_TITLE:=Xray Extender
 LUCI_DESCRIPTION:=Subscription management, server health monitoring and balancer tools for luci-app-xray.
-LUCI_DEPENDS:=+luci-base +luci-app-xray +lua +lua-cjson +libubox-lua +libubus-lua +libuci-lua +wget-ssl
+LUCI_DEPENDS:=+luci-base +luci-app-xray +lua +lua-cjson +libubox-lua +libubus-lua +libuci-lua +wget-ssl +libnghttp2
+LUCI_BUILD_DEPENDS:=lua nghttp2
 
-PKG_VERSION:=0.4.9
-PKG_RELEASE:=7
+PKG_VERSION:=0.5.0
+PKG_RELEASE:=2
 
 # The init script and helper scripts are executable at runtime. ZIP files made
 # on Windows may lose Unix mode bits, so restore them after luci.mk copies root/.

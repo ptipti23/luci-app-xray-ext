@@ -44,6 +44,7 @@ var manualRefreshStatusGeneration = 0;
 var manualRefreshRequestAt = 0;
 var manualRefreshAwaitingStatus = false;
 var manualRefreshPollStarted = false;
+var manualRefreshPreviousStatus = null;
 var pendingChanges = {
 	xrayCore: false,
 	xrayExt: false
@@ -169,6 +170,27 @@ var xrayExtdStatus = rpc.declare({
     params: []
 });
 
+var xrayExtdOutbounds = rpc.declare({
+    object: 'xray_extd',
+    method: 'outbounds',
+    params: [],
+    reject: true
+});
+
+var xrayExtdRemoveOutbound = rpc.declare({
+    object: 'xray_extd',
+    method: 'remove_outbound',
+    params: [ 'tag' ],
+    reject: true
+});
+
+var xrayExtdBalancerInfo = rpc.declare({
+    object: 'xray_extd',
+    method: 'balancer_info',
+    params: [ 'tag' ],
+    reject: true
+});
+
 /* Читаем актуальные секции xray_core напрямую через ubus.
  * Не делаем uci.unload()/uci.load(), чтобы не затронуть локальные изменения формы.
  */
@@ -266,20 +288,29 @@ function readManualRefreshStatus(container) {
             if (generation !== manualRefreshStatusGeneration)
                 return null;
 
-            if (manualRefreshAwaitingStatus) {
-                var state = status.state || 'unknown';
-                var requestedAt = Number(status.requested_at || 0);
-                var terminal = state === 'done' || state === 'done_with_errors';
+			if (manualRefreshAwaitingStatus) {
+			    var state = status.state || 'unknown';
+			    var terminal = state === 'done' || state === 'done_with_errors';
+			    var previous = manualRefreshPreviousStatus;
 
-                /* Не позволяем запоздалому ответу со старым idle/результатом
-                 * затереть только что подтверждённый запрос. */
-                if (state === 'idle' ||
-                    (terminal && requestedAt > 0 && requestedAt < manualRefreshRequestAt)) {
-                    return null;
-                }
+			    var unchangedPreviousResult =
+			        terminal &&
+			        previous &&
+			        state === previous.state &&
+			        Number(status.requested_at || 0) === previous.requested_at &&
+			        Number(status.started_at || 0) === previous.started_at &&
+			        Number(status.finished_at || 0) === previous.finished_at &&
+			        Number(status.total || 0) === previous.total &&
+			        Number(status.completed || 0) === previous.completed &&
+			        Number(status.succeeded || 0) === previous.succeeded &&
+			        Number(status.failed || 0) === previous.failed;
 
-                manualRefreshAwaitingStatus = false;
-            }
+			    if (state === 'idle' || unchangedPreviousResult)
+			        return null;
+
+			    manualRefreshAwaitingStatus = false;
+			    manualRefreshPreviousStatus = null;
+			}
 
             manualRefreshLastStatus = status;
             manualRefreshRequestPending = manualRefreshIsBusy(status);
@@ -338,6 +369,17 @@ function requestManualRefresh() {
 
     if (manualRefreshRequestPending || manualRefreshIsBusy(manualRefreshLastStatus))
         return Promise.resolve();
+
+	manualRefreshPreviousStatus = manualRefreshLastStatus ? {
+	    state: manualRefreshLastStatus.state,
+	    requested_at: Number(manualRefreshLastStatus.requested_at || 0),
+	    started_at: Number(manualRefreshLastStatus.started_at || 0),
+	    finished_at: Number(manualRefreshLastStatus.finished_at || 0),
+	    total: Number(manualRefreshLastStatus.total || 0),
+	    completed: Number(manualRefreshLastStatus.completed || 0),
+	    succeeded: Number(manualRefreshLastStatus.succeeded || 0),
+	    failed: Number(manualRefreshLastStatus.failed || 0)
+	} : null;
 
     manualRefreshStatusGeneration++;
     manualRefreshRequestAt = Math.floor(Date.now() / 1000);
@@ -830,25 +872,27 @@ function removeOutbound(tag) {
 
     console.log('REMOVE TAG:', tag);
 
-    return exec('/usr/bin/xray', [
-        'api',
-        'rmo',
-        '--server=127.0.0.1:8080',
-        tag
-    ])
+    return xrayExtdRemoveOutbound(tag)
         .then(function(res) {
 
-            console.log('Xray EXEC RESULT:', res);
+            console.log('Xray Extender REMOVE RESULT:', res);
 
-            if (res.code !== 0) {
-                console.error('Xray API ERROR:', res.stderr || res.stdout);
-                return Promise.reject(res);
+            if (!res || res.success !== true) {
+                var message = res && res.error
+                    ? res.error
+                    : 'Failed to remove outbound: ' + tag;
+
+                console.error('Xray REMOVE ERROR:', message);
+
+                return Promise.reject(new Error(message));
             }
+
+            console.log('Xray REMOVE VERIFIED:', res.tag);
 
             return res;
         })
         .catch(function(err) {
-            console.error('Xray EXEC ERROR:', err);
+            console.error('Xray REMOVE ERROR:', err);
             throw err;
         })
         .finally(function() {
@@ -909,72 +953,29 @@ function addOutbound(jsonObj) {
  * =========================================================
  */
 
+
 function getRuntimeOutbounds(force) {
     if (!force && runtimeOutboundsPromise)
         return runtimeOutboundsPromise;
 
-    runtimeOutboundsPromise = exec('/usr/bin/xray', [
-        'api',
-        'lso',
-        '--server=127.0.0.1:8080'
-    ])
-        .then(function(res) {
+    runtimeOutboundsPromise = xrayExtdOutbounds()
+        .then(function(data) {
 
-            if (res.code !== 0) {
-                console.error('Xray lso error:', res.stderr || res.stdout);
-                return Promise.reject(res);
-            }
+            if (!data || data.success === false) {
+                var message = data && data.error
+                    ? data.error
+                    : 'Invalid response from xray_extd.outbounds';
 
-            var data;
-
-            try {
-                data = JSON.parse(res.stdout);
-            }
-            catch (e) {
-                console.error('Cannot parse xray lso:', e);
-                console.error('Raw lso output:', res.stdout);
-                throw e;
+                console.error('Xray Extender outbounds error:', message);
+                return Promise.reject(new Error(message));
             }
 
             var result = {
-                tcp_v4: [],
-                tcp_v6: [],
-                udp_v4: [],
-                udp_v6: []
+                tcp_v4: Array.isArray(data.tcp_v4) ? data.tcp_v4 : [],
+                tcp_v6: Array.isArray(data.tcp_v6) ? data.tcp_v6 : [],
+                udp_v4: Array.isArray(data.udp_v4) ? data.udp_v4 : [],
+                udp_v6: Array.isArray(data.udp_v6) ? data.udp_v6 : []
             };
-
-            (data.outbounds || []).forEach(function(outbound) {
-
-                var tag = outbound.tag || '';
-
-                var prefix;
-                var target;
-
-                if (tag.indexOf('tcp_balancer_v4@balancer_outbound:') === 0) {
-                    prefix = 'tcp_balancer_v4@balancer_outbound:';
-                    target = result.tcp_v4;
-                }
-                else if (tag.indexOf('tcp_balancer_v6@balancer_outbound:') === 0) {
-                    prefix = 'tcp_balancer_v6@balancer_outbound:';
-                    target = result.tcp_v6;
-                }
-                else if (tag.indexOf('udp_balancer_v4@balancer_outbound:') === 0) {
-                    prefix = 'udp_balancer_v4@balancer_outbound:';
-                    target = result.udp_v4;
-                }
-                else if (tag.indexOf('udp_balancer_v6@balancer_outbound:') === 0) {
-                    prefix = 'udp_balancer_v6@balancer_outbound:';
-                    target = result.udp_v6;
-                }
-                else {
-                    return;
-                }
-
-                var cfg = tag.substring(prefix.length);
-
-                if (cfg && target.indexOf(cfg) === -1)
-                    target.push(cfg);
-            });
 
             var runtimeSnapshot = JSON.stringify(result);
 
@@ -988,6 +989,7 @@ function getRuntimeOutbounds(force) {
 
     return runtimeOutboundsPromise;
 }
+
 
 /*
  * Быстрый снимок только списков балансировщиков.
@@ -2212,25 +2214,19 @@ function getBalancerCfg(tag) {
  */
 
 function getBalancerInfo(balancerTag) {
-    return exec('/usr/bin/xray', [
-        'api',
-        'bi',
-        '--server=127.0.0.1:8080',
-        balancerTag
-    ])
+    return xrayExtdBalancerInfo(balancerTag)
         .then(function(res) {
 
-            if (res.code !== 0) {
-                console.error('Balancer info error:', balancerTag, res.stderr || res.stdout);
+            if (!res || !res.success) {
+                console.error(
+                    'Balancer info error:',
+                    balancerTag,
+                    res && res.error ? res.error : 'Unknown error'
+                );
                 return null;
             }
 
-            var match = res.stdout.match(/Selects:\s*\n\s*1\s+(\S+)/);
-
-            if (!match)
-                return null;
-
-            return match[1];
+            return res.selected || null;
         });
 }
 
