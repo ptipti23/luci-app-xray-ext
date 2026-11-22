@@ -1200,11 +1200,16 @@ local function build_outbound(server, list_name)
 
         elseif server.transport == "ws" then
 
-            print(
-                "xray_extd: WARNING: WS transport "
-                .. "is not implemented yet: "
-                .. tostring(cfg)
-            )
+            outbound.streamSettings.wsSettings = {}
+
+            if server.ws_path and server.ws_path ~= "" then
+                outbound.streamSettings.wsSettings.path =
+                    server.ws_path
+            end
+
+            if server.ws_host and server.ws_host ~= "" then
+                outbound.streamSettings.wsSettings.host = server.ws_host
+            end
 
         elseif server.transport == "grpc" then
 
@@ -2605,7 +2610,9 @@ local VLESS_FIELDS = {
     "vless_reality_show",
     "vless_reality_spider_x",
     "splithttp_path",
-    "splithttp_host"
+    "splithttp_host",
+    "ws_path",
+    "ws_host"
 }
 
 local HYSTERIA_FIELDS = {
@@ -2792,6 +2799,10 @@ local function build_subscription_target(server)
             -- Path and host are first-class SplitHTTP options.
             target.splithttp_path = optional_value(transport.path)
             target.splithttp_host = optional_value(transport.host)
+
+        elseif transport.type == "ws" then
+            target.ws_path = optional_value(transport.path)
+            target.ws_host = optional_value(transport.host)
         end
 
     elseif server.protocol == "hysteria" then

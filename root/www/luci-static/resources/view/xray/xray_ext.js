@@ -1254,6 +1254,21 @@ function applyCustomConfig(outbound, server) {
 }
 
 /* =========================================================
+ * Раздел: Websocket
+ * =========================================================
+ */
+
+function applyWsTransport(outbound, server) {
+    outbound.streamSettings.wsSettings = {};
+
+    if (server.ws_path)
+        outbound.streamSettings.wsSettings.path = server.ws_path;
+
+    if (server.ws_host)
+        outbound.streamSettings.wsSettings.host = server.ws_host;
+}
+
+/* =========================================================
  * Раздел: Split HTTP
  * =========================================================
  */

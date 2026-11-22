@@ -198,18 +198,40 @@ local function collect_stream_extras(stream, protocol)
                     result.tlsSettings = extras
                 end
 
-            elseif (key == "xhttpSettings" or key == "splithttpSettings") and
-                protocol == "vless" then
-                local split = copy_table(value)
-                if type(split) ~= "table" then
-                    split = {}
-                end
-                -- path and host have first-class UCI fields.
-                split.path = nil
-                split.host = nil
-                if has_values(split) then
-                    result.splithttpSettings = split
-                end
+			elseif (key == "xhttpSettings" or key == "splithttpSettings") and
+			    protocol == "vless" then
+			    local split = copy_table(value)
+			    if type(split) ~= "table" then
+			        split = {}
+			    end
+
+			    -- path and host have first-class UCI fields.
+			    split.path = nil
+			    split.host = nil
+
+			    if has_values(split) then
+			        result.splithttpSettings = split
+			    end
+
+			    elseif key == "wsSettings" and protocol == "vless" then
+			        local ws = copy_table(value)
+			        if type(ws) ~= "table" then
+			            ws = {}
+			        end
+
+			        -- path and headers.Host have first-class UCI fields.
+			        ws.path = nil
+
+			        if type(ws.headers) == "table" then
+			            ws.headers.Host = nil
+			            if not has_values(ws.headers) then
+			                ws.headers = nil
+			            end
+			        end
+
+			        if has_values(ws) then
+			            result.wsSettings = ws
+			        end
 
             elseif key == "hysteriaSettings" and protocol == "hysteria" then
                 local extras = without_keys(value, {
@@ -356,12 +378,15 @@ local function parse_vless(outbound, config, alias)
         return nil, "unsupported VLESS security mode: " .. security
     end
 
-    local xhttp
-    if type(stream.xhttpSettings) == "table" then
-        xhttp = stream.xhttpSettings
-    else
-        xhttp = as_table(stream.splithttpSettings)
-    end
+	local transport_settings
+
+	if transport_type == "ws" then
+	    transport_settings = as_table(stream.wsSettings)
+	elseif type(stream.xhttpSettings) == "table" then
+	    transport_settings = stream.xhttpSettings
+	else
+	    transport_settings = as_table(stream.splithttpSettings)
+	end
     local custom_config = make_custom_config(outbound, "vless")
 
     return {
@@ -375,15 +400,17 @@ local function parse_vless(outbound, config, alias)
         vless_encryption = trim(user.encryption),
         domain_strategy = trim(as_table(stream.sockopt).domainStrategy),
         security = security,
-        transport = {
-            type = transport_type,
-            path = trim(xhttp.path),
-            host = trim(xhttp.host),
-            mode = trim(xhttp.mode),
-            -- mode/extra are already retained in custom_config under
-            -- splithttpSettings; do not duplicate or flatten them here.
-            extra = ""
-        },
+		transport = {
+		    type = transport_type,
+		    path = trim(transport_settings.path),
+		    host = transport_type == "ws"
+		        and trim(as_table(transport_settings.headers).Host)
+		        or trim(transport_settings.host),
+		    mode = trim(transport_settings.mode),
+		    -- mode/extra are already retained in custom_config under
+		    -- splithttpSettings; do not duplicate or flatten them here.
+		    extra = ""
+		},
         tls = item_tls,
         custom_config = custom_config,
         source_tag = trim(outbound.tag),

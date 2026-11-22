@@ -17,6 +17,8 @@
  *
  * Currently supported:
  *   TCP + REALITY
+ *
+ * Not yet supported:
  *   SplitHTTP
  *   TLS
  *   TCP custom settings
@@ -35,6 +37,9 @@
 
 #define HYSTERIA_TRANSPORT_TYPE \
     "xray.transport.internet.hysteria.Config"
+
+#define WEBSOCKET_TYPE \
+    "xray.transport.internet.websocket.Config"
 
 #define SENDER_CONFIG_TYPE \
     "xray.app.proxyman.SenderConfig"
@@ -1915,6 +1920,103 @@ cleanup:
 
 
 /* =========================================================
+ * Websocket transport Config
+ * Xray-core v26.10.21
+ * =========================================================
+ */
+ 
+static xray_build_result build_websocket_settings(
+    lua_State *L,
+    int settings_index,
+    xray_pb_buffer *result,
+    char *error,
+    size_t error_len)
+{
+    static const char * const allowed_keys[] = {
+        "host",
+        "path"
+    };
+
+    xray_pb_buffer config;
+
+    const char *host = NULL;
+    size_t host_len = 0;
+
+    const char *path = NULL;
+    size_t path_len = 0;
+
+    int top;
+    xray_build_result status = XRAY_BUILD_ERROR;
+
+    top = lua_gettop(L);
+    settings_index = lua_abs_index(L, settings_index);
+
+    xray_pb_buffer_init(result);
+    xray_pb_buffer_init(&config);
+
+    status = check_table_keys(
+        L,
+        settings_index,
+        "wsSettings",
+        allowed_keys,
+        sizeof(allowed_keys) / sizeof(allowed_keys[0]),
+        error,
+        error_len
+    );
+
+    if (status != XRAY_BUILD_OK)
+        goto cleanup;
+
+    if (get_optional_string(
+            L, settings_index, "host",
+            &host, &host_len,
+            error, error_len) != 0)
+        goto cleanup;
+
+    if (get_optional_string(
+            L, settings_index, "path",
+            &path, &path_len,
+            error, error_len) != 0)
+        goto cleanup;
+
+    if (host_len != 0 &&
+        xray_pb_append_string(&config, 1, host) != 0)
+        goto encode_error;
+
+    if (path_len != 0 &&
+        xray_pb_append_string(&config, 2, path) != 0)
+        goto encode_error;
+
+    if (xray_pb_make_typed_message(
+            WEBSOCKET_TYPE,
+            &config,
+            result) != 0)
+        goto encode_error;
+
+    status = XRAY_BUILD_OK;
+    goto cleanup;
+
+encode_error:
+    builder_error(
+        error,
+        error_len,
+        "cannot encode WebSocket protobuf"
+    );
+
+    status = XRAY_BUILD_ERROR;
+
+cleanup:
+    lua_settop(L, top);
+    xray_pb_buffer_clear(&config);
+
+    if (status != XRAY_BUILD_OK)
+        xray_pb_buffer_clear(result);
+
+    return status;
+}
+
+
+/* =========================================================
  * QUIC parameters from finalmask.quicParams
  *
  * Currently supported:
@@ -2368,6 +2470,7 @@ xray_build_result xray_build_sender_settings(
         "tlsSettings",
         "splithttpSettings",
         "hysteriaSettings",
+        "wsSettings",
         "finalmask",
         "sockopt"
     };
@@ -2376,6 +2479,7 @@ xray_build_result xray_build_sender_settings(
     xray_pb_buffer socket;
     xray_pb_buffer split_settings;
     xray_pb_buffer hysteria_settings;
+    xray_pb_buffer websocket_settings;
     xray_pb_buffer transport_config;
     xray_pb_buffer quic_params;
     xray_pb_buffer stream;
@@ -2398,6 +2502,7 @@ xray_build_result xray_build_sender_settings(
     int quic_present = 0;
 
     int hysteria_network = 0;
+    int websocket_network = 0;
     int splithttp_network = 0;
 
     xray_build_result status = XRAY_BUILD_ERROR;
@@ -2422,6 +2527,7 @@ xray_build_result xray_build_sender_settings(
     xray_pb_buffer_init(&socket);
     xray_pb_buffer_init(&split_settings);
     xray_pb_buffer_init(&hysteria_settings);
+    xray_pb_buffer_init(&websocket_settings);
     xray_pb_buffer_init(&transport_config);
     xray_pb_buffer_init(&quic_params);
     xray_pb_buffer_init(&stream);
@@ -2492,6 +2598,11 @@ xray_build_result xray_build_sender_settings(
             network_name = "hysteria";
             hysteria_network = 1;
         }
+        else if (strcasecmp(network, "ws") == 0 ||
+                 strcasecmp(network, "websocket") == 0) {
+            network_name = "websocket";
+            websocket_network = 1;
+        }
         else {
             builder_error(
                 error, error_len,
@@ -2546,6 +2657,53 @@ xray_build_result xray_build_sender_settings(
                 &transport_config,
                 3,
                 "splithttp") != 0)
+            goto encode_error;
+
+        transport_present = 1;
+    }
+
+    /*
+     * Build WebSocket transport.
+     */
+
+    if (websocket_network) {
+        lua_getfield(L, stream_index, "wsSettings");
+
+        if (lua_type(L, -1) != LUA_TTABLE) {
+            builder_error(
+                error, error_len,
+                "wsSettings must be a table"
+            );
+
+            status = XRAY_BUILD_ERROR;
+            goto cleanup;
+        }
+
+        settings_index = lua_abs_index(L, -1);
+
+        status = build_websocket_settings(
+            L,
+            settings_index,
+            &websocket_settings,
+            error,
+            error_len
+        );
+
+        lua_pop(L, 1);
+
+        if (status != XRAY_BUILD_OK)
+            goto cleanup;
+
+        if (xray_pb_append_message(
+                &transport_config,
+                2,
+                &websocket_settings) != 0)
+            goto encode_error;
+
+        if (xray_pb_append_string(
+                &transport_config,
+                3,
+                "websocket") != 0)
             goto encode_error;
 
         transport_present = 1;
@@ -2864,6 +3022,7 @@ cleanup:
     xray_pb_buffer_clear(&socket);
     xray_pb_buffer_clear(&split_settings);
     xray_pb_buffer_clear(&hysteria_settings);
+    xray_pb_buffer_clear(&websocket_settings);
     xray_pb_buffer_clear(&transport_config);
     xray_pb_buffer_clear(&quic_params);
     xray_pb_buffer_clear(&stream);

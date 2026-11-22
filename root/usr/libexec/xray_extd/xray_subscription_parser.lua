@@ -226,6 +226,7 @@ local function parse_vless(uri)
             type = transport_type,
             source_type = network,
             path = params.path or "",
+            host = params.host or "",
             mode = params.mode or "",
             extra = params.extra or ""
         },
