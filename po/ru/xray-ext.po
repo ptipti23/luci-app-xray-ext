@@ -276,3 +276,15 @@ msgstr "При включении подписки загружаются от �
 
 msgid "The dedicated subscription downloader account is not installed correctly. Reinstall Xray Extender and try again."
 msgstr "Системная учётная запись загрузчика подписок установлена некорректно. Переустановите Xray Extender и повторите попытку."
+
+msgid "Next retry in %s."
+msgstr "Следующая попытка через %s."
+
+msgid "Retry is due; waiting for daemon…"
+msgstr "Время повтора наступило; ожидание демона…"
+
+msgid "Waiting subscriptions: %d."
+msgstr "Подписки, ожидают повтора: %d."
+
+msgid "Failed attempts: %d."
+msgstr "Неудачных попыток: %d."

@@ -5,7 +5,7 @@ local uci = require("uci")
 local ubus = require("ubus")
 local ubus_conn = ubus.connect()
 
-local VERSION = "0.5.0-r2-backup-subscription-health-manual-ubus-runtime-snapshot-direct-subscriptions-json-subscriptions-duplicate-alias-indexing-async-parallel-subscription-refresh-timeout-sequential-apply-manual-ui-native-grpc-ado-ss2022-compact-ado-rmo-logs"
+local VERSION = "0.5.0-r3"
 local INTERVAL = 10000
 
 -- Persistent probe outbounds for backup TCP IPv4 subscription health checks.
@@ -2300,6 +2300,7 @@ local SUBSCRIPTION_LIVE_CONFIRM = 9
 
 local pending_update_requests = {}
 local scheduled_update_requests = {}
+local manual_retry_attempts = {}
 local last_subscription_fetch = {}
 
 -- Async subscription downloads
@@ -2356,6 +2357,34 @@ local function subscription_can_manual_update(sub, role)
 end
 
 
+local PRIMARY_HEALTH_UPDATE_REASONS = {
+    subscription_dead = true,
+    subscription_dead_retry = true,
+    group_dead = true
+}
+
+local function subscription_has_primary_selection(config, ext_id)
+    local server_meta = config.server_meta or {}
+
+    for _, list_name in ipairs({
+        "tcp_v4",
+        "tcp_v6",
+        "udp_v4",
+        "udp_v6"
+    }) do
+        for _, cfg in ipairs(config[list_name] or {}) do
+            local meta = server_meta[cfg]
+
+            if meta and tostring(meta.ext_id) == tostring(ext_id) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+
 local function queue_update_request(
     config,
     ext_id,
@@ -2365,10 +2394,19 @@ local function queue_update_request(
 )
     local sub = config.subscriptions[ext_id]
 
-    local allowed =
-        (reason == MANUAL_REFRESH_REASON and
-            subscription_can_manual_update(sub, role)) or
-        subscription_can_auto_update(sub, role)
+	local selection_required =
+	    PRIMARY_HEALTH_UPDATE_REASONS[reason] == true
+
+	local selection_ok =
+	    not selection_required or
+	    subscription_has_primary_selection(config, ext_id)
+
+	local allowed =
+	    selection_ok and (
+	        (reason == MANUAL_REFRESH_REASON and
+	            subscription_can_manual_update(sub, role)) or
+	        subscription_can_auto_update(sub, role)
+	    )
 
     if not allowed then
         return false
@@ -2377,6 +2415,10 @@ local function queue_update_request(
     delay = tonumber(delay) or 0
 
     if delay > 0 then
+	    if reason == MANUAL_REFRESH_REASON then
+	        manual_retry_attempts[ext_id] =
+	            (manual_retry_attempts[ext_id] or 0) + 1
+	    end
         local request =
             scheduled_update_requests[ext_id]
 
@@ -2449,6 +2491,60 @@ local function cancel_scheduled_update_reason(
 
     if next(request.reasons) == nil then
         scheduled_update_requests[ext_id] = nil
+    end
+end
+
+
+local function prune_unselected_primary_health_requests(config)
+    local queues = {
+        scheduled_update_requests,
+        pending_update_requests
+    }
+
+    for ext_id, _ in pairs(config.subscriptions or {}) do
+        if not subscription_has_primary_selection(config, ext_id) then
+            for _, queue in ipairs(queues) do
+                local request = queue[ext_id]
+
+                if request then
+                    local removed = false
+
+                    for reason, _ in pairs(request.reasons) do
+                        if PRIMARY_HEALTH_UPDATE_REASONS[reason] then
+                            request.reasons[reason] = nil
+                            removed = true
+                        end
+                    end
+
+                    if removed then
+                        print(
+                            "xray_extd: AUTO UPDATE CANCELLED ext_id=" ..
+                            tostring(ext_id) ..
+                            " reason=no selected primary servers"
+                        )
+
+                        if next(request.reasons) == nil then
+                            queue[ext_id] = nil
+                        end
+                    end
+                end
+            end
+
+            -- Reset stale primary health state.
+            for _, group in ipairs({
+                "tcp_v4",
+                "tcp_v6",
+                "udp_v4",
+                "udp_v6"
+            }) do
+                local key = group .. ":" .. tostring(ext_id)
+
+                subscription_dead_confirmed[key] = nil
+                subscription_dead_streak[key] = nil
+                subscription_live_streak[key] = nil
+                last_subscription_states[key] = nil
+            end
+        end
     end
 end
 
@@ -3920,6 +4016,7 @@ local function process_subscription_fetch_result(
                 )
 
             if applied then
+            	manual_retry_attempts[ext_id] = nil
                 last_subscription_fetch[ext_id] = now
 
                 finish_manual_refresh_target(ext_id, true)
@@ -5377,10 +5474,38 @@ local function heartbeat()
     -- Daily refresh of backup subscriptions in auto mode is disabled.
     -- A future health-based backup refresh mechanism will own this path.
 
-    queue_manual_refreshes(config)
-    flush_update_requests(config, os.time())
+	queue_manual_refreshes(config)
+
+	prune_unselected_primary_health_requests(config)
+
+	flush_update_requests(config, os.time())
 end
 
+local function get_scheduled_update_status()
+    local count = 0
+    local next_retry_at = 0
+    local retry_attempts = 0
+
+    for _, request in pairs(scheduled_update_requests) do
+        count = count + 1
+
+        if request.reasons[MANUAL_REFRESH_REASON] then
+            retry_attempts = math.max(
+                retry_attempts,
+                manual_retry_attempts[request.ext_id] or 0
+            )
+        end
+
+        local due_at = tonumber(request.due_at) or 0
+
+        if due_at > 0 and
+           (next_retry_at == 0 or due_at < next_retry_at) then
+            next_retry_at = due_at
+        end
+    end
+
+    return count, next_retry_at, retry_attempts
+end
 
 if ubus_conn then
     local control_object = {
@@ -5422,22 +5547,29 @@ if ubus_conn then
                 end,
                 {}
             },
-            status = {
-                function(req, msg)
-                    ubus_conn:reply(req, {
-                        state = manual_refresh_status.state,
-                        message = manual_refresh_status.message,
-                        requested_at = manual_refresh_status.requested_at or 0,
-                        started_at = manual_refresh_status.started_at or 0,
-                        finished_at = manual_refresh_status.finished_at or 0,
-                        total = manual_refresh_status.total or 0,
-                        completed = manual_refresh_status.completed or 0,
-                        succeeded = manual_refresh_status.succeeded or 0,
-                        failed = manual_refresh_status.failed or 0
-                    })
-                end,
-                {}
-            },
+			status = {
+			    function(req, msg)
+			        local retry_count, retry_at, retry_attempts =
+			            get_scheduled_update_status()
+
+			        ubus_conn:reply(req, {
+			            state = manual_refresh_status.state,
+			            message = manual_refresh_status.message,
+			            requested_at = manual_refresh_status.requested_at or 0,
+			            started_at = manual_refresh_status.started_at or 0,
+			            finished_at = manual_refresh_status.finished_at or 0,
+			            total = manual_refresh_status.total or 0,
+			            completed = manual_refresh_status.completed or 0,
+			            succeeded = manual_refresh_status.succeeded or 0,
+			            failed = manual_refresh_status.failed or 0,
+
+			            retry_count = retry_count,
+			            retry_at = retry_at,
+			            retry_attempts = retry_attempts
+			        })
+			    end,
+			    {}
+			},
             outbounds = {
                 function(req, msg)
                     local result = get_runtime_outbounds()

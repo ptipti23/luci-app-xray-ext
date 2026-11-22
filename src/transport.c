@@ -2890,6 +2890,9 @@ xray_build_result xray_build_sender_settings(
         if (status != XRAY_BUILD_OK)
             goto cleanup;
     }
+    else if (strcasecmp(security, "none") == 0) {
+        security_type = NULL;
+    }
     else {
         builder_error(
             error, error_len,
@@ -2953,17 +2956,19 @@ xray_build_result xray_build_sender_settings(
             network_name) != 0)
         goto encode_error;
 
-    if (xray_pb_append_string(
-            &stream,
-            3,
-            security_type) != 0)
-        goto encode_error;
+    if (security_type != NULL) {
+        if (xray_pb_append_string(
+                &stream,
+                3,
+                security_type) != 0)
+            goto encode_error;
 
-    if (xray_pb_append_message(
-            &stream,
-            4,
-            &security_settings) != 0)
-        goto encode_error;
+        if (xray_pb_append_message(
+                &stream,
+                4,
+                &security_settings) != 0)
+            goto encode_error;
+    }
 
     if (transport_present &&
         xray_pb_append_message(

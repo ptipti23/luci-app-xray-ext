@@ -226,6 +226,19 @@ function manualRefreshButtonLabel(state) {
     }
 }
 
+function formatRetryCountdown(retryAt) {
+    var remaining = Math.max(
+        0,
+        Math.ceil(Number(retryAt) - Date.now() / 1000)
+    );
+
+    var minutes = Math.floor(remaining / 60);
+    var seconds = remaining % 60;
+
+    return ('0' + minutes).slice(-2) + ':' +
+           ('0' + seconds).slice(-2);
+}
+
 function updateManualRefreshPanel(status, container) {
     container = container || document.getElementById('xray-extd-manual-refresh-panel');
     if (!container || !status)
@@ -279,6 +292,26 @@ function updateManualRefreshPanel(status, container) {
 	        new Date(Number(status.finished_at) * 1000).toLocaleString()
 	    );
 	}
+
+    var retryCount = Number(status.retry_count || 0);
+    var retryAt = Number(status.retry_at || 0);
+    var retryAttempts = Number(status.retry_attempts || 0);
+
+    if (state === 'done_with_errors' && retryCount > 0 && retryAt > 0) {
+        var remaining = retryAt - Date.now() / 1000;
+
+        if (remaining > 0) {
+            message += ' ' + _('Next retry in %s.').format(
+                formatRetryCountdown(retryAt)
+            );
+        }
+        else {
+            message += ' ' + _('Retry is due; waiting for daemon…');
+        }
+
+        message += ' ' + _('Waiting subscriptions: %d.').format(retryCount);
+        message += ' ' + _('Failed attempts: %d.').format(retryAttempts);
+    }
 
     output.textContent = message;
     button.textContent = manualRefreshButtonLabel(state);
