@@ -239,6 +239,7 @@ function formatRetryCountdown(retryAt) {
            ('0' + seconds).slice(-2);
 }
 
+var manualRefreshCountdownTimer = null;
 function updateManualRefreshPanel(status, container) {
     container = container || document.getElementById('xray-extd-manual-refresh-panel');
     if (!container || !status)
@@ -317,6 +318,33 @@ function updateManualRefreshPanel(status, container) {
     button.textContent = manualRefreshButtonLabel(state);
     button.disabled = manualRefreshRequestPending || manualRefreshIsBusy(status);
     button.classList.toggle('spinning', state === 'running');
+
+    var hasRetryCountdown =
+        state === 'done_with_errors' &&
+        retryCount > 0 &&
+        retryAt > 0;
+
+    if (hasRetryCountdown) {
+        if (!manualRefreshCountdownTimer) {
+            manualRefreshCountdownTimer = setInterval(function() {
+                var panel = document.getElementById(
+                    'xray-extd-manual-refresh-panel'
+                );
+
+                if (!panel) {
+                    clearInterval(manualRefreshCountdownTimer);
+                    manualRefreshCountdownTimer = null;
+                    return;
+                }
+
+                updateManualRefreshPanel(status, panel);
+            }, 1000);
+        }
+    }
+    else if (manualRefreshCountdownTimer) {
+        clearInterval(manualRefreshCountdownTimer);
+        manualRefreshCountdownTimer = null;
+    }
 }
 
 function readManualRefreshStatus(container) {
