@@ -8,7 +8,7 @@ LUCI_DEPENDS:=+luci-base +luci-app-xray +lua +lua-cjson +libubox-lua +libubus-lu
 LUCI_BUILD_DEPENDS:=lua nghttp2
 
 PKG_VERSION:=0.5.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 # The init script and helper scripts are executable at runtime. ZIP files made
 # on Windows may lose Unix mode bits, so restore them after luci.mk copies root/.
