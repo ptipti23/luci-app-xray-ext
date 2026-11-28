@@ -1,12 +1,13 @@
 #!/bin/sh
-# Apply the two guarded luci-app-xray compatibility patches required by
-# Xray Extended. Safe to run repeatedly; unknown upstream layouts are not changed.
+# Apply guarded luci-app-xray compatibility patches required by Xray Extender.
+# Safe to run repeatedly; unknown upstream layouts are not changed.
 
 set -eu
 
 GEN_CONFIG="${XRAY_EXT_GEN_CONFIG:-/usr/share/xray/gen_config.uc}"
 SYSTEM_MJS="${XRAY_EXT_SYSTEM_MJS:-/usr/share/xray/feature/system.mjs}"
 TLS_MJS="${XRAY_EXT_TLS_MJS:-/usr/share/xray/common/tls.mjs}"
+STREAM_MJS="${XRAY_EXT_STREAM_MJS:-/usr/share/xray/common/stream.mjs}"
 BACKUP_DIR="${XRAY_EXT_PATCH_BACKUP_DIR:-/etc/xray_ext/patch-backups}"
 ACTION="${1:-check}"
 
@@ -198,6 +199,57 @@ check_tls_mjs() {
     fi
 }
 
+# Issue #525: WebSocket Host must use the dedicated wsSettings.host field.
+stream_ws_block() {
+    awk '
+        /function[[:space:]]+stream_ws[[:space:]]*\(/ {
+            active = 1
+        }
+        active && /function[[:space:]]+stream_kcp[[:space:]]*\(/ {
+            exit
+        }
+        active {
+            print
+        }
+    ' "$STREAM_MJS"
+}
+
+check_stream_mjs() {
+    local block
+    block="$(stream_ws_block)"
+
+    if [ -z "$block" ] || \
+       ! printf '%s\n' "$block" | \
+           grep -Eq 'path[[:space:]]*:[[:space:]]*server\["ws_path"\]' || \
+       ! printf '%s\n' "$block" | \
+           grep -Eq 'return[[:space:]]+null[[:space:]]*;'; then
+        STREAM_STATE='unsupported'
+        return 0
+    fi
+
+    # Already fixed: ws_host is mapped to the dedicated host property.
+    if printf '%s\n' "$block" | \
+           grep -Eq 'host[[:space:]]*:[[:space:]]*server\["ws_host"\]' && \
+       ! printf '%s\n' "$block" | \
+           grep -Eq 'Host[[:space:]]*:[[:space:]]*server\["ws_host"\]'; then
+        STREAM_STATE='patched'
+        return 0
+    fi
+
+    # Known old implementation: Host is incorrectly placed in headers.
+    if printf '%s\n' "$block" | \
+           grep -Eq 'let[[:space:]]+headers[[:space:]]*=[[:space:]]*null[[:space:]]*;' && \
+       printf '%s\n' "$block" | \
+           grep -Eq 'Host[[:space:]]*:[[:space:]]*server\["ws_host"\]' && \
+       printf '%s\n' "$block" | \
+           grep -Eq 'headers[[:space:]]*:[[:space:]]*headers'; then
+        STREAM_STATE='needs-patch'
+        return 0
+    fi
+
+    STREAM_STATE='unsupported'
+}
+
 get_mode() {
     stat -c '%a' "$1" 2>/dev/null || printf '644\n'
 }
@@ -360,6 +412,68 @@ patch_tls_mjs() {
     say 'TLS compatibility patch applied: obsolete allowInsecure option removed'
 }
 
+patch_stream_mjs() {
+    local tmp mode
+    tmp="${STREAM_MJS}.xray-ext.$$"
+    mode="$(get_mode "$STREAM_MJS")"
+
+    awk '
+        /function[[:space:]]+stream_ws[[:space:]]*\(/ {
+            found++
+
+            if (found > 1)
+                exit 2
+
+            print "function stream_ws(server) {"
+            print "    if (server[\"transport\"] === \"ws\") {"
+            print "        return {"
+            print "            path: server[\"ws_path\"],"
+            print "            host: server[\"ws_host\"],"
+            print "        };"
+            print "    }"
+            print "    return null;"
+            print "}"
+
+            in_stream_ws = 1
+            next
+        }
+
+        in_stream_ws && \
+        /function[[:space:]]+stream_kcp[[:space:]]*\(/ {
+            in_stream_ws = 0
+            next_function_found = 1
+        }
+
+        in_stream_ws {
+            next
+        }
+
+        {
+            print
+        }
+
+        END {
+            if (found != 1 || !next_function_found)
+                exit 2
+        }
+    ' "$STREAM_MJS" > "$tmp" || {
+        rm -f "$tmp"
+        fail "could not safely patch $STREAM_MJS (unexpected stream_ws() layout)"
+    }
+
+    chmod "$mode" "$tmp" || {
+        rm -f "$tmp"
+        fail "could not preserve permissions on $STREAM_MJS"
+    }
+
+    mv "$tmp" "$STREAM_MJS" || {
+        rm -f "$tmp"
+        fail "could not install patched $STREAM_MJS"
+    }
+
+    say 'patch #525 applied: WebSocket Host moved to dedicated wsSettings.host'
+}
+
 patch_system_mjs() {
     local tmp mode
     tmp="${SYSTEM_MJS}.xray-ext.$$"
@@ -425,23 +539,28 @@ patch_system_mjs() {
 require_file "$GEN_CONFIG"
 require_file "$SYSTEM_MJS"
 require_file "$TLS_MJS"
+require_file "$STREAM_MJS"
 
 check_gen_config
 check_system_mjs
 check_tls_mjs
+check_stream_mjs
 
 if [ -n "${GEN_DETAIL:-}" ]; then
     say "gen_config.uc (#520): $GEN_STATE ($GEN_DETAIL)"
 else
     say "gen_config.uc (#520): $GEN_STATE"
 fi
+
 say "feature/system.mjs (#523): $API_STATE"
 say "common/tls.mjs (TLS compatibility): $TLS_STATE"
+say "common/stream.mjs (#525): $STREAM_STATE"
 
 if [ "$ACTION" = 'check' ]; then
     [ "$GEN_STATE" = 'patched' ] && \
     [ "$API_STATE" = 'patched' ] && \
-    [ "$TLS_STATE" = 'patched' ] || exit 2
+    [ "$TLS_STATE" = 'patched' ] && \
+    [ "$STREAM_STATE" = 'patched' ] || exit 2
     say 'all required upstream patches are present'
     exit 0
 fi
@@ -453,6 +572,7 @@ fi
 [ "$GEN_STATE" != 'unsupported' ] || fail "unrecognized balancers() selector in $GEN_CONFIG; leaving it untouched"
 [ "$API_STATE" != 'unsupported' ] || fail "unrecognized api_conf() in $SYSTEM_MJS; leaving it untouched"
 [ "$TLS_STATE" != 'unsupported' ] || fail "unrecognized tls_outbound_settings() in $TLS_MJS; leaving it untouched"
+[ "$STREAM_STATE" != 'unsupported' ] || fail "unrecognized stream_ws() in $STREAM_MJS; leaving it untouched"
 
 if [ "$GEN_STATE" = 'needs-patch' ]; then
     backup_file "$GEN_CONFIG"
@@ -469,10 +589,19 @@ if [ "$TLS_STATE" = 'needs-patch' ]; then
     patch_tls_mjs
 fi
 
+if [ "$STREAM_STATE" = 'needs-patch' ]; then
+    backup_file "$STREAM_MJS"
+    patch_stream_mjs
+fi
+
 check_gen_config
 check_system_mjs
 check_tls_mjs
+check_stream_mjs
+
 [ "$GEN_STATE" = 'patched' ] || fail "verification failed for $GEN_CONFIG"
 [ "$API_STATE" = 'patched' ] || fail "verification failed for $SYSTEM_MJS"
 [ "$TLS_STATE" = 'patched' ] || fail "verification failed for $TLS_MJS"
+[ "$STREAM_STATE" = 'patched' ] || fail "verification failed for $STREAM_MJS"
+
 say 'all required upstream patches are present'

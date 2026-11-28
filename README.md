@@ -8,6 +8,8 @@ The extension works alongside the original `luci-app-xray` package. It does not 
 
 - **Subscription management** — import and update server subscriptions, track subscription metadata and handle missing or changed servers.
 - **Multiple subscription formats** — plain-text URI lists, Base64-encoded URI lists and JSON Xray configurations.
+- **Adaptive subscription retries** — retry failed subscriptions every five minutes during the first hour, then once per hour until recovery.
+- **Smart manual refresh** — refresh only failed subscriptions during the initial retry window, then allow a full refresh of all enabled subscriptions.
 - **Server health monitoring** — monitor primary and backup servers, with configurable confirmation thresholds to avoid reacting to short-lived state changes.
 - **Automatic failover** — dynamically add backup outbounds when a primary group becomes unavailable and remove them when normal operation is restored.
 - **Runtime outbound management** — inspect, add and remove Xray outbounds without restarting Xray.
@@ -30,6 +32,8 @@ xray_extd daemon
      +---- Subscription downloader
      |
      +---- Subscription parsers
+     |
+     +---- Subscription retry manager
      |
      +---- Server health monitoring
      |
@@ -81,10 +85,45 @@ Subscription downloads use an asynchronous `uloop.process` pipeline:
 1. Up to three downloads can run concurrently.
 2. Results are processed sequentially.
 3. Each update follows the `PLAN → APPLY → COMMIT` sequence.
-4. Failed downloads are retried after the configured retry delay.
-5. A download has a 60-second deadline; a timed-out process is terminated, followed by a forced kill if necessary.
+4. Each subscription is tracked independently by its subscription ID (`ext_id`).
+5. Failed downloads and unsuccessful update operations enter the automatic retry system.
+6. A download has a 60-second deadline; a timed-out process is terminated, followed by a forced kill if necessary.
 
 The downloader separates response data from HTTP headers and diagnostic output.
+
+### Automatic retry policy
+
+Failed subscription updates use an adaptive retry schedule:
+
+- During the first hour after the initial failure, the daemon retries every five minutes.
+- After one hour of continuous failures, the retry interval changes to once per hour.
+- Hourly retries continue indefinitely until the subscription is successfully updated.
+- A successful update clears the retry history for that subscription.
+- Retry state is maintained separately for each subscription, so one subscription recovering does not affect another subscription's retry schedule.
+
+The retry mechanism is independent of the regular subscription update interval. An enabled subscription can continue receiving failure retries even when its normal update interval is set to manual.
+
+Retry state is stored in:
+
+```text
+/tmp/xray_ext/subscription_retry_state.json
+```
+
+The state survives daemon restarts but is temporary and is lost after a full router reboot.
+
+### Manual refresh behaviour
+
+The manual refresh button adapts its scope to the current retry state:
+
+- If there are no subscriptions awaiting retry, all enabled subscriptions are refreshed.
+- During the initial one-hour retry window, manual refresh targets only failed subscriptions.
+- Once all recorded failures have entered the hourly cooldown phase, the next manual refresh targets all enabled subscriptions.
+- Failed subscriptions that remain unavailable after a full manual refresh start a new one-hour retry window.
+- Successfully updated subscriptions have their retry history cleared.
+
+Manual refreshes do not disable the automatic retry mechanism. The daemon continues to maintain retry schedules independently.
+
+This approach avoids repeatedly downloading healthy subscriptions during short recovery periods while still allowing a complete manual refresh after prolonged failures.
 
 ### Direct downloads
 
@@ -120,6 +159,10 @@ Relevant options include:
 - `backup_subscription_live_confirm`
 
 The daemon checks WAN link state before performing network-dependent work. WAN availability is based on the link state, not on a general Internet reachability test.
+
+When a primary group is confirmed available again, stale scheduled `group_dead` subscription update requests are cancelled, including when no backup servers were available and failover was never activated.
+
+This prevents unnecessary subscription downloads after a primary group recovers on its own.
 
 **Important:** a server reported as alive by the current health checks is not necessarily capable of delivering usable application throughput. Connection health and real-world service quality are different measurements. Quality-aware failover remains a separate area for future development.
 
@@ -236,8 +279,15 @@ The package includes guarded patches for compatibility with the installed upstre
 | `gen_config.uc` (#520) | Preserve dynamic outbound selection by extending built-in balancer selectors |
 | `feature/system.mjs` (#523) | Enable the required RoutingService API |
 | `common/tls.mjs` | Maintain TLS configuration compatibility where required |
+| `common/stream.mjs` (#525) | Map WebSocket Host to the dedicated `host` property instead of treating it as a generic HTTP header |
 
-The patch manager keeps backups under:
+The WebSocket compatibility patch moves `ws_host` into the dedicated WebSocket `host` setting. It does not treat the Host value as an ordinary HTTP header.
+
+The patch manager applies these compatibility patches automatically when the Xray Extender daemon service starts.
+
+Each patch checks the expected upstream source layout before applying changes. Existing patches are detected and skipped. Unknown source layouts are left untouched and cause the patch operation to fail rather than blindly modifying upstream files.
+
+Original files are backed up under:
 
 ```text
 /etc/xray_ext/patch-backups/
@@ -250,7 +300,7 @@ xray-ext-patches check
 xray-ext-patches apply
 ```
 
-The patcher checks the expected source layout before applying changes and is designed to be safe to run repeatedly.
+The patcher is designed to be safe to run repeatedly.
 
 ## Important files and locations
 
@@ -264,6 +314,7 @@ The patcher checks the expected source layout before applying changes and is des
 | `/etc/config/xray_ext` | Persistent Xray Extender configuration |
 | `/etc/xray_ext/subscription_meta.json` | Subscription metadata |
 | `/etc/xray_ext/patch-backups/` | Upstream patch backups |
+| `/tmp/xray_ext/subscription_retry_state.json` | Temporary per-subscription retry state |
 | `/tmp/xray_extd_runtime_lists.json` | Temporary runtime outbound snapshot |
 
 The backup server lists in `/etc/config/xray_ext` are part of the failover configuration. Do not remove them when cleaning up or troubleshooting the package.
@@ -295,6 +346,12 @@ ubus -v list xray_extd
 ubus call xray_extd outbounds '{}'
 ```
 
+Check upstream patch status:
+
+```sh
+xray-ext-patches check
+```
+
 For ADO/RMO diagnostics, look for messages containing:
 
 ```text
@@ -305,6 +362,17 @@ RMO FAILED
 ADO VERIFIED
 BACKUP PROBE
 FAILOVER
+```
+
+For subscription retry diagnostics, look for messages containing:
+
+```text
+SUBSCRIPTION RETRY SCHEDULED
+SUBSCRIPTION RETRY RESTORED
+SUBSCRIPTION RETRY STATE CLEARED
+UPDATE FETCH START FAILED
+UPDATE FETCH/PARSE FAILED
+UPDATE APPLY FAILED
 ```
 
 ## Build
@@ -338,13 +406,21 @@ The main configuration is stored in:
 /etc/config/xray_ext
 ```
 
-Subscription metadata and patch backups are stored under:
+Subscription metadata and patch backups are stored persistently under:
 
 ```text
 /etc/xray_ext/
 ```
 
-Back up these locations before manual cleanup, package removal or major configuration changes.
+Temporary runtime data, including subscription retry state, is stored under:
+
+```text
+/tmp/xray_ext/
+```
+
+Temporary retry state survives daemon restarts but is lost after a full router reboot.
+
+Back up the persistent configuration and metadata locations before manual cleanup, package removal or major configuration changes.
 
 The package complements `luci-app-xray`; its configuration and runtime operations depend on the Xray-core configuration and API being available.
 

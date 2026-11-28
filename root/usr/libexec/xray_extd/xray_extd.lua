@@ -5,7 +5,7 @@ local uci = require("uci")
 local ubus = require("ubus")
 local ubus_conn = ubus.connect()
 
-local VERSION = "0.5.0-r3"
+local VERSION = "0.5.0-r4"
 local INTERVAL = 10000
 
 -- Persistent probe outbounds for backup TCP IPv4 subscription health checks.
@@ -2340,6 +2340,136 @@ local AUTO_UPDATE_DELAY = 5 * 60
 local UPDATE_RETRY_DELAY = 5 * 60
 
 
+-- Persistent per-subscription download retry state.
+local SUBSCRIPTION_RETRY_STATE_PATH =
+    "/tmp/xray_ext/subscription_retry_state.json"
+
+local SUBSCRIPTION_RETRY_REASON =
+    "subscription_failure_retry"
+
+local SUBSCRIPTION_RETRY_BURST_WINDOW = 60 * 60
+local SUBSCRIPTION_RETRY_BURST_DELAY = 5 * 60
+local SUBSCRIPTION_RETRY_COOLDOWN_DELAY = 60 * 60
+
+local function load_subscription_retry_states()
+    local file = io.open(SUBSCRIPTION_RETRY_STATE_PATH, "r")
+
+    if not file then
+        return {}
+    end
+
+    local contents = file:read("*a") or ""
+    file:close()
+
+    if contents == "" then
+        return {}
+    end
+
+    local ok, data = pcall(cjson.decode, contents)
+
+    if not ok or type(data) ~= "table" then
+        print(
+            "xray_extd: subscription retry state file is invalid; " ..
+            "starting with an empty state"
+        )
+        return {}
+    end
+
+    for ext_id, state in pairs(data) do
+        if type(ext_id) ~= "string"
+           or type(state) ~= "table"
+           or not tonumber(state.first_failure_at)
+           or not tonumber(state.next_retry_at) then
+            data[ext_id] = nil
+        else
+            state.first_failure_at =
+                tonumber(state.first_failure_at)
+            state.last_failure_at =
+                tonumber(state.last_failure_at) or
+                state.first_failure_at
+            state.next_retry_at =
+                tonumber(state.next_retry_at)
+            state.attempts =
+                tonumber(state.attempts) or 1
+        end
+    end
+
+    return data
+end
+
+local subscription_retry_states = {}
+local function save_subscription_retry_states()
+    local encoded_ok, encoded =
+        pcall(cjson.encode, subscription_retry_states)
+
+    if not encoded_ok or type(encoded) ~= "string" then
+        print("xray_extd: cannot encode subscription retry state")
+        return false
+    end
+
+    local mkdir_pipe = io.popen(
+        "mkdir -p /tmp/xray_ext 2>&1",
+        "r"
+    )
+
+    if not mkdir_pipe then
+        print("xray_extd: cannot create retry state directory")
+        return false
+    end
+
+    mkdir_pipe:read("*a")
+    local mkdir_ok, mkdir_reason, mkdir_code =
+        mkdir_pipe:close()
+
+    if mkdir_ok == nil or mkdir_ok == false then
+        print(
+            "xray_extd: retry state mkdir failed: " ..
+            tostring(mkdir_reason or "") .. " " ..
+            tostring(mkdir_code or "")
+        )
+        return false
+    end
+
+    local temp_path =
+        SUBSCRIPTION_RETRY_STATE_PATH ..
+        ".tmp." .. tostring(os.time()) ..
+        "." .. tostring(math.random(100000, 999999))
+
+    local file = io.open(temp_path, "w")
+
+    if not file then
+        print("xray_extd: cannot open retry state temporary file")
+        return false
+    end
+
+    local write_ok = file:write(encoded, "\n")
+    local close_ok = file:close()
+
+    if not write_ok or close_ok == nil then
+        os.remove(temp_path)
+        print("xray_extd: cannot write retry state file")
+        return false
+    end
+
+    local rename_ok, rename_error =
+        os.rename(temp_path, SUBSCRIPTION_RETRY_STATE_PATH)
+
+    if not rename_ok then
+        os.remove(temp_path)
+        print(
+            "xray_extd: cannot replace retry state file: " ..
+            tostring(rename_error)
+        )
+        return false
+    end
+
+    return true
+end
+
+subscription_retry_states =
+    load_subscription_retry_states()
+
+
 local function subscription_can_auto_update(sub, role)
     return
         sub and
@@ -2354,6 +2484,15 @@ local function subscription_can_manual_update(sub, role)
         sub and
         sub.enabled and
         sub.role == role
+end
+
+
+local function subscription_can_retry_update(sub, role, ext_id)
+    return
+        sub and
+        sub.enabled and
+        sub.role == role and
+        subscription_retry_states[tostring(ext_id)] ~= nil
 end
 
 
@@ -2401,10 +2540,15 @@ local function queue_update_request(
 	    not selection_required or
 	    subscription_has_primary_selection(config, ext_id)
 
+	local is_subscription_retry =
+	    reason == SUBSCRIPTION_RETRY_REASON and
+	    subscription_can_retry_update(sub, role, ext_id)
+
 	local allowed =
 	    selection_ok and (
 	        (reason == MANUAL_REFRESH_REASON and
 	            subscription_can_manual_update(sub, role)) or
+	        is_subscription_retry or
 	        subscription_can_auto_update(sub, role)
 	    )
 
@@ -2477,6 +2621,193 @@ local function queue_update_request(
 end
 
 
+local function schedule_subscription_retry(
+    config,
+    ext_id,
+    role,
+    now,
+    reset_window
+)
+    local key = tostring(ext_id)
+    now = tonumber(now) or os.time()
+
+    local state = subscription_retry_states[key]
+
+    if type(state) ~= "table" or reset_window then
+        state = {
+            first_failure_at = now,
+            attempts = 0
+        }
+    end
+
+    state.first_failure_at =
+        tonumber(state.first_failure_at) or now
+    state.last_failure_at = now
+    state.attempts = (tonumber(state.attempts) or 0) + 1
+
+    local elapsed = math.max(0, now - state.first_failure_at)
+
+    local delay =
+        elapsed < SUBSCRIPTION_RETRY_BURST_WINDOW
+        and SUBSCRIPTION_RETRY_BURST_DELAY
+        or SUBSCRIPTION_RETRY_COOLDOWN_DELAY
+
+    state.next_retry_at = now + delay
+    subscription_retry_states[key] = state
+
+    local queued = queue_update_request(
+        config,
+        key,
+        SUBSCRIPTION_RETRY_REASON,
+        role,
+        delay
+    )
+
+    if not queued then
+        subscription_retry_states[key] = nil
+        save_subscription_retry_states()
+
+        print(
+            "xray_extd: subscription retry not scheduled ext_id=" ..
+            key .. " reason=subscription is no longer eligible"
+        )
+
+        return false
+    end
+
+    local scheduled = scheduled_update_requests[key]
+    if scheduled then
+        state.next_retry_at =
+            tonumber(scheduled.due_at) or state.next_retry_at
+    end
+
+    save_subscription_retry_states()
+
+    print(
+        "xray_extd: SUBSCRIPTION RETRY SCHEDULED ext_id=" ..
+        key ..
+        " attempt=" .. tostring(state.attempts) ..
+        " delay=" .. tostring(delay) ..
+        " phase=" ..
+            (elapsed < SUBSCRIPTION_RETRY_BURST_WINDOW
+                and "burst" or "cooldown")
+    )
+
+    return true
+end
+
+
+local function subscription_retry_is_queued(ext_id)
+    local key = tostring(ext_id)
+
+    for _, queue in ipairs({
+        pending_update_requests,
+        scheduled_update_requests
+    }) do
+        local request = queue[key]
+
+        if request
+           and request.reasons
+           and request.reasons[SUBSCRIPTION_RETRY_REASON] then
+            return true
+        end
+    end
+
+    return false
+end
+
+
+local function restore_subscription_retry_requests(config, now)
+    if type(config) ~= "table"
+       or type(config.subscriptions) ~= "table" then
+        return
+    end
+
+    now = tonumber(now) or os.time()
+
+    for ext_id, state in pairs(subscription_retry_states) do
+        local key = tostring(ext_id)
+        local sub = config.subscriptions[key]
+
+        if sub and sub.enabled and type(state) == "table" then
+            local pending = pending_update_requests[key]
+            local scheduled = scheduled_update_requests[key]
+            local active = active_subscription_fetches[key]
+
+            local pending_retry =
+                pending and
+                type(pending.reasons) == "table" and
+                pending.reasons[SUBSCRIPTION_RETRY_REASON] == true
+
+            local scheduled_retry =
+                scheduled and
+                type(scheduled.reasons) == "table" and
+                scheduled.reasons[SUBSCRIPTION_RETRY_REASON] == true
+
+            if not active and not pending_retry and not scheduled_retry then
+                local due_at =
+                    tonumber(state.next_retry_at) or now
+
+                local delay = math.max(0, due_at - now)
+
+                local queued = queue_update_request(
+                    config,
+                    key,
+                    SUBSCRIPTION_RETRY_REASON,
+                    sub.role,
+                    delay
+                )
+
+                if queued then
+                    scheduled = scheduled_update_requests[key]
+
+                    if scheduled then
+                        state.next_retry_at =
+                            tonumber(scheduled.due_at) or due_at
+                    end
+
+                    print(
+                        "xray_extd: SUBSCRIPTION RETRY RESTORED ext_id=" ..
+                        key ..
+                        " delay=" .. tostring(delay)
+                    )
+                else
+                    print(
+                        "xray_extd: SUBSCRIPTION RETRY RESTORE FAILED ext_id=" ..
+                        key
+                    )
+                end
+            end
+        end
+    end
+end
+
+
+local function should_restart_subscription_retry_window(
+    request,
+    ext_id,
+    now
+)
+    if type(request) ~= "table"
+       or type(request.reasons) ~= "table"
+       or request.reasons[MANUAL_REFRESH_REASON] ~= true then
+        return false
+    end
+
+    local state = subscription_retry_states[tostring(ext_id)]
+
+    if type(state) ~= "table" then
+        return false
+    end
+
+    local first_failure_at =
+        tonumber(state.first_failure_at) or now
+
+    return now - first_failure_at >=
+        SUBSCRIPTION_RETRY_BURST_WINDOW
+end
+
+
 local function cancel_scheduled_update_reason(
     ext_id,
     reason
@@ -2491,6 +2822,72 @@ local function cancel_scheduled_update_reason(
 
     if next(request.reasons) == nil then
         scheduled_update_requests[ext_id] = nil
+    end
+end
+
+
+local function cancel_queued_update_reason(ext_id, reason)
+    local changed = false
+
+    local scheduled = scheduled_update_requests[ext_id]
+
+    if scheduled
+       and scheduled.reasons
+       and scheduled.reasons[reason] then
+        changed = true
+    end
+
+    cancel_scheduled_update_reason(ext_id, reason)
+
+    local pending = pending_update_requests[ext_id]
+
+    if pending
+       and pending.reasons
+       and pending.reasons[reason] then
+
+        changed = true
+        pending.reasons[reason] = nil
+
+        if next(pending.reasons) == nil then
+            pending_update_requests[ext_id] = nil
+        end
+    end
+
+    return changed
+end
+
+
+local function clear_subscription_retry_state(ext_id)
+    local key = tostring(ext_id)
+
+    local had_state =
+        subscription_retry_states[key] ~= nil
+
+    subscription_retry_states[key] = nil
+    manual_retry_attempts[key] = nil
+
+    cancel_scheduled_update_reason(
+        key,
+        SUBSCRIPTION_RETRY_REASON
+    )
+
+    local pending = pending_update_requests[key]
+
+    if pending then
+        pending.reasons[SUBSCRIPTION_RETRY_REASON] = nil
+
+        if next(pending.reasons) == nil then
+            pending_update_requests[key] = nil
+        end
+    end
+
+    if had_state then
+        save_subscription_retry_states()
+
+        print(
+            "xray_extd: SUBSCRIPTION RETRY STATE CLEARED ext_id=" ..
+            key .. " reason=update succeeded"
+        )
     end
 end
 
@@ -2602,9 +2999,41 @@ local function queue_manual_refreshes(config)
     manual_refresh_requested = false
     manual_refresh_targets = {}
 
+    local now = os.time()
+    local failed_ext_ids = {}
+    local has_recent_failures = false
+
+    -- Find enabled subscriptions with recorded download failures.
+    for ext_id, sub in pairs(config.subscriptions or {}) do
+        if sub and sub.enabled then
+            local key = tostring(ext_id)
+            local retry_state = subscription_retry_states[key]
+
+            if type(retry_state) == "table" then
+                failed_ext_ids[key] = true
+
+                local first_failure_at =
+                    tonumber(retry_state.first_failure_at) or now
+
+                if now - first_failure_at <
+                   SUBSCRIPTION_RETRY_BURST_WINDOW then
+                    has_recent_failures = true
+                end
+            end
+        end
+    end
+
+    -- First refresh: all subscriptions.
+    -- During the first failure hour: only failed subscriptions.
+    -- Once all recorded failures reach cooldown: all subscriptions again.
+    local refresh_all =
+        next(failed_ext_ids) == nil or
+        not has_recent_failures
+
     manual_refresh_status.state = "running"
-    manual_refresh_status.message = "Manual subscription refresh in progress"
-    manual_refresh_status.started_at = os.time()
+    manual_refresh_status.message =
+        "Manual subscription refresh in progress"
+    manual_refresh_status.started_at = now
     manual_refresh_status.finished_at = 0
     manual_refresh_status.total = 0
     manual_refresh_status.completed = 0
@@ -2612,15 +3041,22 @@ local function queue_manual_refreshes(config)
     manual_refresh_status.failed = 0
 
     local ext_ids = {}
+
     for ext_id, sub in pairs(config.subscriptions or {}) do
         if sub and sub.enabled then
-            table.insert(ext_ids, tostring(ext_id))
+            local key = tostring(ext_id)
+
+            if refresh_all or failed_ext_ids[key] then
+                table.insert(ext_ids, key)
+            end
         end
     end
+
     table.sort(ext_ids)
 
     for _, ext_id in ipairs(ext_ids) do
         local sub = config.subscriptions[ext_id]
+
         if queue_update_request(
             config,
             ext_id,
@@ -2629,18 +3065,24 @@ local function queue_manual_refreshes(config)
             0
         ) then
             manual_refresh_targets[ext_id] = true
-            manual_refresh_status.total = manual_refresh_status.total + 1
+            manual_refresh_status.total =
+                manual_refresh_status.total + 1
         end
     end
 
+    local scope = refresh_all and "all" or "failed"
+
     print(
-        "xray_extd: MANUAL REFRESH queued subscriptions=" ..
+        "xray_extd: MANUAL REFRESH queued scope=" ..
+        scope ..
+        " subscriptions=" ..
         tostring(manual_refresh_status.total)
     )
 
     if manual_refresh_status.total == 0 then
         manual_refresh_status.state = "done"
-        manual_refresh_status.message = "No enabled subscriptions to refresh"
+        manual_refresh_status.message =
+            "No enabled subscriptions to refresh"
         manual_refresh_status.finished_at = os.time()
     end
 end
@@ -3880,6 +4322,7 @@ process_pending_runtime_rebuilds = function(now)
     return pending
 end
 
+
 -- ============================================================
 -- Обработка результата загрузки подписки
 -- ============================================================
@@ -3934,21 +4377,23 @@ local function process_subscription_fetch_result(
         if not plan then
             print(
                 "xray_extd: UPDATE PLAN FAILED ext_id=" .. ext_id ..
-                " error=" .. tostring(plan_error) ..
-                "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
+                " error=" .. tostring(plan_error)
             )
 
-            for reason, _ in pairs(request.reasons) do
-                queue_update_request(
-                    config,
+            schedule_subscription_retry(
+                config,
+                ext_id,
+                sub.role,
+                now,
+                should_restart_subscription_retry_window(
+                    request,
                     ext_id,
-                    reason,
-                    request.role,
-                    UPDATE_RETRY_DELAY
+                    now
                 )
-            end
+            )
 
             finish_manual_refresh_target(ext_id, false)
+
         else
             print(
                 "xray_extd: UPDATE PLAN ext_id=" .. ext_id ..
@@ -3963,7 +4408,9 @@ local function process_subscription_fetch_result(
                 " mark_missing=" .. tostring(plan.mark_missing) ..
                 " already_missing=" .. tostring(plan.already_missing) ..
                 " delete=" .. tostring(plan.delete) ..
-                (plan.missing_guarded and " missing_actions=blocked_unsafe_parse" or "")
+                (plan.missing_guarded
+                    and " missing_actions=blocked_unsafe_parse"
+                    or "")
             )
 
             local printed = 0
@@ -4016,8 +4463,9 @@ local function process_subscription_fetch_result(
                 )
 
             if applied then
-            	manual_retry_attempts[ext_id] = nil
                 last_subscription_fetch[ext_id] = now
+
+                clear_subscription_retry_state(ext_id)
 
                 finish_manual_refresh_target(ext_id, true)
 
@@ -4035,22 +4483,24 @@ local function process_subscription_fetch_result(
                     " delete=" .. tostring(plan.delete) ..
                     " runtime_sync_pending=" .. tostring(runtime_pending)
                 )
+
             else
                 print(
                     "xray_extd: UPDATE APPLY FAILED ext_id=" .. ext_id ..
-                    " error=" .. tostring(apply_error) ..
-                    "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
+                    " error=" .. tostring(apply_error)
                 )
 
-                for reason, _ in pairs(request.reasons) do
-                    queue_update_request(
-                        config,
+                schedule_subscription_retry(
+                    config,
+                    ext_id,
+                    sub.role,
+                    now,
+                    should_restart_subscription_retry_window(
+                        request,
                         ext_id,
-                        reason,
-                        request.role,
-                        UPDATE_RETRY_DELAY
+                        now
                     )
-                end
+                )
 
                 finish_manual_refresh_target(ext_id, false)
             end
@@ -4062,26 +4512,29 @@ local function process_subscription_fetch_result(
                 " missing-server actions blocked because feed is not fully understood"
             )
         end
+
     else
         print(
             "xray_extd: UPDATE FETCH/PARSE FAILED ext_id=" .. ext_id ..
-            " error=" .. tostring(result) ..
-            "; retrying in " .. tostring(UPDATE_RETRY_DELAY) .. " seconds"
+            " error=" .. tostring(result)
         )
 
-        for reason, _ in pairs(request.reasons) do
-            queue_update_request(
-                config,
+        schedule_subscription_retry(
+            config,
+            ext_id,
+            sub.role,
+            now,
+            should_restart_subscription_retry_window(
+                request,
                 ext_id,
-                reason,
-                request.role,
-                UPDATE_RETRY_DELAY
+                now
             )
-        end
+        )
 
         finish_manual_refresh_target(ext_id, false)
     end
 end
+
 
 -- ============================================================
 -- Асинхронная загрузка подписок
@@ -4506,12 +4959,17 @@ process_completed_subscription_fetches = function()
             local is_manual_request =
                 job.request.reasons[MANUAL_REFRESH_REASON] == true
 
-            local allowed =
-                sub and (
-                    (is_manual_request and
-                        subscription_can_manual_update(sub, sub.role)) or
-                    subscription_can_auto_update(sub, sub.role)
-                )
+			local is_subscription_retry =
+			    job.request.reasons[SUBSCRIPTION_RETRY_REASON] == true and
+			    subscription_can_retry_update(sub, job.request.role, ext_id)
+
+			local allowed =
+			    sub and (
+			        (is_manual_request and
+			            subscription_can_manual_update(sub, sub.role)) or
+			        is_subscription_retry or
+			        subscription_can_auto_update(sub, sub.role)
+			    )
 
             if not allowed then
                 print(
@@ -4558,30 +5016,38 @@ process_completed_subscription_fetches = function()
         end)
 
         if not ok then
-            print(
-                "xray_extd: UPDATE RESULT CALLBACK FAILED ext_id=" .. ext_id ..
-                " error=" .. tostring(process_error)
-            )
 
-            local retry_config = read_xray_config()
-            local retry_sub =
-                retry_config and
-                retry_config.subscriptions and
-                retry_config.subscriptions[ext_id]
+			print(
+			    "xray_extd: UPDATE RESULT CALLBACK FAILED ext_id=" .. ext_id ..
+			    " error=" .. tostring(process_error)
+			)
 
-            if retry_config and retry_sub then
-                for reason, _ in pairs(job.request.reasons) do
-                    queue_update_request(
-                        retry_config,
-                        ext_id,
-                        reason,
-                        retry_sub.role,
-                        UPDATE_RETRY_DELAY
-                    )
-                end
-            end
+			local retry_config = read_xray_config()
+			local retry_sub =
+			    retry_config and
+			    retry_config.subscriptions and
+			    retry_config.subscriptions[ext_id]
 
-            finish_manual_refresh_target(ext_id, false)
+			if retry_config
+			   and retry_sub
+			   and not subscription_retry_is_queued(ext_id) then
+
+			    local retry_now = os.time()
+
+			    schedule_subscription_retry(
+			        retry_config,
+			        ext_id,
+			        retry_sub.role,
+			        retry_now,
+			        should_restart_subscription_retry_window(
+			            job.request,
+			            ext_id,
+			            retry_now
+			        )
+			    )
+			end
+
+			finish_manual_refresh_target(ext_id, false)
         end
 
         active_subscription_fetches[ext_id] = nil
@@ -4630,10 +5096,15 @@ dispatch_pending_subscription_fetches = function(config, now)
                 local is_manual_request =
                     request.reasons[MANUAL_REFRESH_REASON] == true
 
-                local allowed =
-                    (is_manual_request and
-                        subscription_can_manual_update(sub, sub and sub.role)) or
-                    subscription_can_auto_update(sub, sub and sub.role)
+				local is_subscription_retry =
+				    request.reasons[SUBSCRIPTION_RETRY_REASON] == true and
+				    subscription_can_retry_update(sub, request.role, ext_id)
+
+				local allowed =
+				    (is_manual_request and
+				        subscription_can_manual_update(sub, sub and sub.role)) or
+				    is_subscription_retry or
+				    subscription_can_auto_update(sub, sub and sub.role)
 
                 if not allowed then
                     pending_update_requests[ext_id] = nil
@@ -4687,27 +5158,27 @@ dispatch_pending_subscription_fetches = function(config, now)
                         active_subscription_fetches[ext_id] = job
                         active_subscription_fetch_count =
                             active_subscription_fetch_count + 1
-                    else
-                        print(
-                            "xray_extd: UPDATE FETCH START FAILED ext_id=" ..
-                            ext_id ..
-                            " error=" .. tostring(start_error) ..
-                            "; retrying in " ..
-                            tostring(UPDATE_RETRY_DELAY) .. " seconds"
-                        )
+					else
+					    print(
+					        "xray_extd: UPDATE FETCH START FAILED ext_id=" ..
+					        ext_id ..
+					        " error=" .. tostring(start_error)
+					    )
 
-                        for reason, _ in pairs(request.reasons) do
-                            queue_update_request(
-                                config,
-                                ext_id,
-                                reason,
-                                request.role,
-                                UPDATE_RETRY_DELAY
-                            )
-                        end
+					    schedule_subscription_retry(
+					        config,
+					        ext_id,
+					        request.role or sub.role,
+					        now,
+					        should_restart_subscription_retry_window(
+					            request,
+					            ext_id,
+					            now
+					        )
+					    )
 
-                        finish_manual_refresh_target(ext_id, false)
-                    end
+					    finish_manual_refresh_target(ext_id, false)
+					end
                 end
                 -- If all slots are occupied, leave this request pending.
             end
@@ -5246,47 +5717,77 @@ local function process_failover_group(
             last_group_states[group_name] = state
         end
 
-        if failover_active[group_name]
-           and group_live_streak[group_name] >= FAILOVER_LIVE_CONFIRM then
+		if failover_active[group_name]
+		   and group_live_streak[group_name] >= FAILOVER_LIVE_CONFIRM then
 
-            if group_live_streak[group_name] == FAILOVER_LIVE_CONFIRM then
-                print(
-                    "xray_extd: GROUP " ..
-                    group_name ..
-                    " confirmed AVAILABLE after " ..
-                    tostring(group_live_streak[group_name]) ..
-                    " checks"
-                )
-            end
+		    if group_live_streak[group_name] == FAILOVER_LIVE_CONFIRM then
+		        print(
+		            "xray_extd: GROUP " ..
+		            group_name ..
+		            " confirmed AVAILABLE after " ..
+		            tostring(group_live_streak[group_name]) ..
+		            " checks"
+		        )
+		    end
 
-            local cleanup_done =
-                stop_failover_group(
-                    group_name,
-                    list_name,
-                    backup_list
-                )
+		    local cleanup_done =
+		        stop_failover_group(
+		            group_name,
+		            list_name,
+		            backup_list
+		        )
 
-            if cleanup_done then
-                group_dead_confirmed[group_name] = false
+		    if cleanup_done then
+		        group_dead_confirmed[group_name] = false
 
-                local recovered_ext_ids =
-                    get_result_subscription_ids(
-                        result,
-                        server_meta
-                    )
+		        local recovered_ext_ids =
+		            get_result_subscription_ids(
+		                result,
+		                server_meta
+		            )
 
-                for ext_id, _ in pairs(recovered_ext_ids) do
-                    cancel_scheduled_update_reason(
-                        ext_id,
-                        "group_dead"
-                    )
-                end
-            end
-        else
-            if not failover_active[group_name] then
-                group_dead_confirmed[group_name] = false
-            end
-        end
+		        for ext_id, _ in pairs(recovered_ext_ids) do
+		            cancel_queued_update_reason(
+		                ext_id,
+		                "group_dead"
+		            )
+		        end
+		    end
+
+		else
+		    if not failover_active[group_name] then
+		        group_dead_confirmed[group_name] = false
+
+		        -- No active failover: the primary group recovered by itself.
+		        -- Cancel its delayed group_dead refresh after confirmed recovery.
+		        if group_live_streak[group_name] >= FAILOVER_LIVE_CONFIRM then
+		            local recovered_ext_ids =
+		                get_result_subscription_ids(
+		                    result,
+		                    server_meta
+		                )
+
+		            local cancelled = false
+
+		            for ext_id, _ in pairs(recovered_ext_ids) do
+		                if cancel_queued_update_reason(
+		                    ext_id,
+		                    "group_dead"
+		                ) then
+		                    cancelled = true
+		                end
+		            end
+
+		            if cancelled then
+		                print(
+		                    "xray_extd: GROUP " ..
+		                    group_name ..
+		                    " recovered without failover; stale group_dead requests cancelled"
+		                )
+		            end
+		        end
+		    end
+		end
 
         return
     end
@@ -5473,6 +5974,8 @@ local function heartbeat()
 
     -- Daily refresh of backup subscriptions in auto mode is disabled.
     -- A future health-based backup refresh mechanism will own this path.
+
+	restore_subscription_retry_requests(config, os.time())
 
 	queue_manual_refreshes(config)
 
